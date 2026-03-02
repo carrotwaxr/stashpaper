@@ -8,12 +8,15 @@ export type Interval =
   | "four_hours"
   | "daily";
 
+export type FitMode = "center" | "crop" | "fit" | "span" | "stretch" | "tile";
+
 export interface Settings {
   stash_url: string;
   api_key: string;
   image_filter: string;
   rotation_mode: RotationMode;
   interval: Interval;
+  fit_mode: FitMode;
   per_monitor: boolean;
   wifi_only: boolean;
 }
@@ -31,4 +34,13 @@ export const ROTATION_MODE_LABELS: Record<RotationMode, string> = {
   random: "Random",
   sequential: "Sequential",
   shuffle: "Shuffle (no repeat)",
+};
+
+export const FIT_MODE_LABELS: Record<FitMode, string> = {
+  center: "Center",
+  crop: "Crop",
+  fit: "Fit",
+  span: "Span",
+  stretch: "Stretch",
+  tile: "Tile",
 };

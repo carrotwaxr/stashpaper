@@ -1,4 +1,5 @@
 mod error;
+mod rotation;
 mod settings;
 mod stash;
 

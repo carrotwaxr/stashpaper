@@ -12,6 +12,7 @@ pub struct Settings {
     pub image_filter: String,
     pub rotation_mode: RotationMode,
     pub interval: Interval,
+    pub fit_mode: FitMode,
     pub per_monitor: bool,
     pub wifi_only: bool,
 }
@@ -22,6 +23,17 @@ pub enum RotationMode {
     Random,
     Sequential,
     Shuffle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FitMode {
+    Center,
+    Crop,
+    Fit,
+    Span,
+    Stretch,
+    Tile,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -56,6 +68,7 @@ impl Default for Settings {
             image_filter: "{}".to_string(),
             rotation_mode: RotationMode::Random,
             interval: Interval::ThirtyMinutes,
+            fit_mode: FitMode::Crop,
             per_monitor: false,
             wifi_only: false,
         }
@@ -104,6 +117,7 @@ mod tests {
             image_filter: r#"{"tags":{"value":["wallpaper"],"modifier":"INCLUDES_ALL"}}"#.into(),
             rotation_mode: RotationMode::Shuffle,
             interval: Interval::OneHour,
+            fit_mode: FitMode::Crop,
             per_monitor: true,
             wifi_only: false,
         };
