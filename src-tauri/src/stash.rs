@@ -98,17 +98,36 @@ pub async fn test_connection(url: &str, api_key: &str) -> Result<bool, AppError>
     Ok(resp.status().is_success())
 }
 
+/// Parse the combined query_filter JSON into separate filter and image_filter values,
+/// merging pagination (per_page, page) into the user's filter.
+fn build_variables(settings: &Settings, per_page: usize, page: usize) -> serde_json::Value {
+    let parsed: serde_json::Value =
+        serde_json::from_str(&settings.query_filter).unwrap_or(serde_json::json!({}));
+
+    let image_filter = parsed.get("image_filter").cloned().unwrap_or(serde_json::json!({}));
+
+    // Start with user's filter, then override pagination
+    let mut filter = match parsed.get("filter") {
+        Some(f) => f.clone(),
+        None => serde_json::json!({}),
+    };
+    if let Some(obj) = filter.as_object_mut() {
+        obj.insert("per_page".into(), serde_json::json!(per_page));
+        obj.insert("page".into(), serde_json::json!(page));
+    }
+
+    serde_json::json!({
+        "filter": filter,
+        "image_filter": image_filter,
+    })
+}
+
 pub async fn query_image_count(settings: &Settings) -> Result<usize, AppError> {
     let client = client_for(settings)?;
-    let image_filter: serde_json::Value =
-        serde_json::from_str(&settings.image_filter).unwrap_or(serde_json::json!({}));
 
     let body = GraphQLRequest {
         query: FIND_IMAGES_QUERY.into(),
-        variables: serde_json::json!({
-            "filter": { "per_page": 1, "page": 1 },
-            "image_filter": image_filter,
-        }),
+        variables: build_variables(settings, 1, 1),
     };
 
     let resp = client
@@ -141,15 +160,10 @@ pub async fn fetch_image_at_page(
     page: usize,
 ) -> Result<Option<StashImage>, AppError> {
     let client = client_for(settings)?;
-    let image_filter: serde_json::Value =
-        serde_json::from_str(&settings.image_filter).unwrap_or(serde_json::json!({}));
 
     let body = GraphQLRequest {
         query: FIND_IMAGES_QUERY.into(),
-        variables: serde_json::json!({
-            "filter": { "per_page": 1, "page": page },
-            "image_filter": image_filter,
-        }),
+        variables: build_variables(settings, 1, page),
     };
 
     let resp = client
@@ -285,16 +299,55 @@ mod tests {
     }
 
     #[test]
-    fn test_image_filter_parsing_empty() {
-        let filter: serde_json::Value =
-            serde_json::from_str("{}").unwrap_or(serde_json::json!({}));
-        assert!(filter.is_object());
+    fn test_build_variables_empty_filter() {
+        let settings = Settings {
+            stash_url: "http://localhost:9999".into(),
+            api_key: "key".into(),
+            query_filter: "{}".into(),
+            ..Settings::default()
+        };
+        let vars = build_variables(&settings, 1, 5);
+        assert_eq!(vars["filter"]["per_page"], 1);
+        assert_eq!(vars["filter"]["page"], 5);
+        assert!(vars["image_filter"].is_object());
     }
 
     #[test]
-    fn test_image_filter_parsing_with_tags() {
-        let filter_str = r#"{"tags":{"value":["wallpaper"],"modifier":"INCLUDES_ALL"}}"#;
-        let filter: serde_json::Value = serde_json::from_str(filter_str).unwrap();
-        assert!(filter["tags"]["value"].is_array());
+    fn test_build_variables_with_user_filter() {
+        let settings = Settings {
+            stash_url: "http://localhost:9999".into(),
+            api_key: "key".into(),
+            query_filter: r#"{
+                "filter": { "sort": "random", "direction": "DESC" },
+                "image_filter": {
+                    "orientation": { "value": "LANDSCAPE" },
+                    "rating100": { "value": 90, "modifier": "GREATER_THAN" }
+                }
+            }"#.into(),
+            ..Settings::default()
+        };
+        let vars = build_variables(&settings, 1, 3);
+        // User's sort/direction preserved
+        assert_eq!(vars["filter"]["sort"], "random");
+        assert_eq!(vars["filter"]["direction"], "DESC");
+        // Pagination merged in
+        assert_eq!(vars["filter"]["per_page"], 1);
+        assert_eq!(vars["filter"]["page"], 3);
+        // Image filter preserved
+        assert_eq!(vars["image_filter"]["orientation"]["value"], "LANDSCAPE");
+        assert_eq!(vars["image_filter"]["rating100"]["value"], 90);
+    }
+
+    #[test]
+    fn test_build_variables_image_filter_only() {
+        let settings = Settings {
+            stash_url: "http://localhost:9999".into(),
+            api_key: "key".into(),
+            query_filter: r#"{"image_filter": {"tags": {"value": ["wallpaper"], "modifier": "INCLUDES_ALL"}}}"#.into(),
+            ..Settings::default()
+        };
+        let vars = build_variables(&settings, 1, 1);
+        assert!(vars["image_filter"]["tags"]["value"].is_array());
+        assert_eq!(vars["filter"]["per_page"], 1);
     }
 }

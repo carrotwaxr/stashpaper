@@ -9,7 +9,7 @@ use crate::error::AppError;
 pub struct Settings {
     pub stash_url: String,
     pub api_key: String,
-    pub image_filter: String,
+    pub query_filter: String,
     pub rotation_mode: RotationMode,
     pub interval: Interval,
     pub fit_mode: FitMode,
@@ -65,7 +65,7 @@ impl Default for Settings {
         Self {
             stash_url: String::new(),
             api_key: String::new(),
-            image_filter: "{}".to_string(),
+            query_filter: r#"{"image_filter": {}, "filter": {}}"#.to_string(),
             rotation_mode: RotationMode::Random,
             interval: Interval::ThirtyMinutes,
             fit_mode: FitMode::Crop,
@@ -122,7 +122,7 @@ mod tests {
         let settings = Settings {
             stash_url: "http://localhost:9999".into(),
             api_key: "test-key".into(),
-            image_filter: r#"{"tags":{"value":["wallpaper"],"modifier":"INCLUDES_ALL"}}"#.into(),
+            query_filter: r#"{"image_filter":{"tags":{"value":["wallpaper"],"modifier":"INCLUDES_ALL"}}}"#.into(),
             rotation_mode: RotationMode::Shuffle,
             interval: Interval::OneHour,
             fit_mode: FitMode::Crop,

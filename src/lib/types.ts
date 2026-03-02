@@ -13,7 +13,7 @@ export type FitMode = "center" | "crop" | "fit" | "span" | "stretch" | "tile";
 export interface Settings {
   stash_url: string;
   api_key: string;
-  image_filter: string;
+  query_filter: string;
   rotation_mode: RotationMode;
   interval: Interval;
   fit_mode: FitMode;

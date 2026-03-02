@@ -10,7 +10,7 @@ import {
 const DEFAULT_SETTINGS: Settings = {
   stash_url: "",
   api_key: "",
-  image_filter: "{}",
+  query_filter: JSON.stringify({ image_filter: {}, filter: {} }, null, 2),
   rotation_mode: "random",
   interval: "thirty_minutes",
   fit_mode: "crop",
@@ -142,19 +142,21 @@ export default function SettingsPanel() {
           </div>
         </section>
 
-        {/* Image Filter */}
+        {/* Query Filter */}
         <section className={sectionClass}>
-          <h2 className={headingClass}>Image Filter</h2>
+          <h2 className={headingClass}>Query Filter</h2>
           <p className="text-sm text-zinc-400">
-            Paste an ImageFilterType JSON from Stash's GraphQL Playground. Use{" "}
-            <code className="rounded bg-zinc-800 px-1">{"{}"}</code> for all
-            images.
+            JSON with <code className="rounded bg-zinc-800 px-1">filter</code>{" "}
+            (sort, direction) and{" "}
+            <code className="rounded bg-zinc-800 px-1">image_filter</code>{" "}
+            (tags, resolution, rating, etc.) from Stash's GraphQL Playground.
           </p>
           <textarea
-            className={`${inputClass} font-mono`}
-            rows={6}
-            value={settings.image_filter}
-            onChange={(e) => update("image_filter", e.target.value)}
+            className={`${inputClass} font-mono text-xs`}
+            rows={8}
+            spellCheck={false}
+            value={settings.query_filter}
+            onChange={(e) => update("query_filter", e.target.value)}
           />
         </section>
 
