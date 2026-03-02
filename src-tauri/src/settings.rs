@@ -6,6 +6,7 @@ use tauri::Manager;
 use crate::error::AppError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
     pub stash_url: String,
     pub api_key: String,
@@ -90,7 +91,13 @@ pub fn load(app: &tauri::AppHandle) -> Result<Settings, AppError> {
         return Ok(Settings::default());
     }
     let contents = std::fs::read_to_string(&path)?;
-    serde_json::from_str(&contents).map_err(|e| AppError::Settings(e.to_string()))
+    match serde_json::from_str(&contents) {
+        Ok(settings) => Ok(settings),
+        Err(e) => {
+            eprintln!("[StashPaper] Failed to parse settings, using defaults: {}", e);
+            Ok(Settings::default())
+        }
+    }
 }
 
 pub fn save(app: &tauri::AppHandle, settings: &Settings) -> Result<(), AppError> {
@@ -153,6 +160,33 @@ mod tests {
     fn test_interval_durations() {
         assert_eq!(Interval::FiveMinutes.to_duration(), Duration::from_secs(300));
         assert_eq!(Interval::Daily.to_duration(), Duration::from_secs(86400));
+    }
+
+    #[test]
+    fn test_missing_fields_use_defaults() {
+        // Simulates loading old settings.json that's missing new fields
+        let json = r#"{"stash_url": "http://localhost:9999", "api_key": "key"}"#;
+        let settings: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.stash_url, "http://localhost:9999");
+        assert_eq!(settings.api_key, "key");
+        // Missing fields should get defaults
+        assert_eq!(settings.rotation_mode, RotationMode::Random);
+        assert_eq!(settings.interval, Interval::ThirtyMinutes);
+        assert_eq!(settings.fit_mode, FitMode::Crop);
+        assert!(!settings.per_monitor);
+        assert!(!settings.wifi_only);
+    }
+
+    #[test]
+    fn test_unknown_fields_ignored() {
+        // Simulates loading settings.json with removed/renamed fields
+        let json = r#"{
+            "stash_url": "http://localhost:9999",
+            "api_key": "key",
+            "image_filter": "old_field_that_no_longer_exists"
+        }"#;
+        let settings: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.stash_url, "http://localhost:9999");
     }
 
     #[test]

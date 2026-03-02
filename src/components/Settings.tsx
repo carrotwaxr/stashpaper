@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { Settings, RotationMode, Interval, FitMode } from "../lib/types";
 import {
@@ -86,6 +86,17 @@ export default function SettingsPanel() {
     }
   }
 
+  const queryFilterError = useMemo(() => {
+    const raw = settings.query_filter.trim();
+    if (!raw) return null;
+    try {
+      JSON.parse(raw);
+      return null;
+    } catch (e) {
+      return (e as SyntaxError).message;
+    }
+  }, [settings.query_filter]);
+
   const inputClass =
     "w-full rounded bg-zinc-800 border border-zinc-700 px-3 py-2 text-zinc-100 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500";
   const selectClass =
@@ -152,12 +163,17 @@ export default function SettingsPanel() {
             (tags, resolution, rating, etc.) from Stash's GraphQL Playground.
           </p>
           <textarea
-            className={`${inputClass} font-mono text-xs`}
+            className={`${inputClass} font-mono text-xs ${queryFilterError ? "border-red-500 focus:ring-red-500" : ""}`}
             rows={8}
             spellCheck={false}
             value={settings.query_filter}
             onChange={(e) => update("query_filter", e.target.value)}
           />
+          {queryFilterError ? (
+            <p className="text-xs text-red-400 mt-1">Invalid JSON: {queryFilterError}</p>
+          ) : settings.query_filter.trim() ? (
+            <p className="text-xs text-green-400 mt-1">Valid JSON</p>
+          ) : null}
         </section>
 
         {/* Rotation */}
@@ -274,9 +290,10 @@ export default function SettingsPanel() {
         <button
           type="button"
           onClick={saveSettings}
-          className="w-full rounded bg-blue-600 px-4 py-2.5 font-medium text-white hover:bg-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:ring-offset-zinc-900"
+          disabled={!!queryFilterError}
+          className="w-full rounded bg-blue-600 px-4 py-2.5 font-medium text-white hover:bg-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:ring-offset-zinc-900 disabled:opacity-50 disabled:cursor-not-allowed"
         >
-          {saved ? "Saved!" : "Save Settings"}
+          {saved ? "Saved!" : queryFilterError ? "Fix JSON to Save" : "Save Settings"}
         </button>
       </div>
     </div>
