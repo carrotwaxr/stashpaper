@@ -8,12 +8,12 @@ import {
 } from "../lib/types";
 
 const DEFAULT_SETTINGS: Settings = {
-  stash_url: "http://localhost:9999",
+  stash_url: "",
   api_key: "",
   image_filter: "{}",
   rotation_mode: "random",
   interval: "thirty_minutes",
-  fit_mode: "fit",
+  fit_mode: "crop",
   per_monitor: false,
   wifi_only: false,
 };
@@ -212,6 +212,7 @@ export default function SettingsPanel() {
             <span className="text-sm text-zinc-300">
               Different wallpaper per monitor
             </span>
+            <span className="text-xs text-zinc-500">(coming soon)</span>
           </label>
           <p className="text-xs text-zinc-500 ml-6">
             Per-monitor support varies by platform and desktop environment.
@@ -231,6 +232,7 @@ export default function SettingsPanel() {
             <span className="text-sm text-zinc-300">
               Only rotate when connected to Wi-Fi
             </span>
+            <span className="text-xs text-zinc-500">(coming soon)</span>
           </label>
         </section>
 

@@ -97,7 +97,15 @@ pub fn save(app: &tauri::AppHandle, settings: &Settings) -> Result<(), AppError>
     let path = settings_path(app)?;
     let contents =
         serde_json::to_string_pretty(settings).map_err(|e| AppError::Settings(e.to_string()))?;
-    std::fs::write(&path, contents)?;
+    std::fs::write(&path, &contents)?;
+
+    // Restrict file permissions to owner-only (contains API key)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+
     Ok(())
 }
 

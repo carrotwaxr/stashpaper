@@ -58,24 +58,7 @@ query FindImages($filter: FindFilterType, $image_filter: ImageFilterType) {
 }
 "#;
 
-fn client_for(settings: &Settings) -> Result<Client, AppError> {
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(
-        "ApiKey",
-        settings
-            .api_key
-            .trim()
-            .parse()
-            .map_err(|e: reqwest::header::InvalidHeaderValue| AppError::Stash(e.to_string()))?,
-    );
-
-    Client::builder()
-        .default_headers(headers)
-        .build()
-        .map_err(|e| AppError::Stash(e.to_string()))
-}
-
-pub async fn test_connection(url: &str, api_key: &str) -> Result<bool, AppError> {
+fn build_client(api_key: &str) -> Result<Client, AppError> {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         "ApiKey",
@@ -85,10 +68,20 @@ pub async fn test_connection(url: &str, api_key: &str) -> Result<bool, AppError>
             .map_err(|e: reqwest::header::InvalidHeaderValue| AppError::Stash(e.to_string()))?,
     );
 
-    let client = Client::builder()
+    Client::builder()
         .default_headers(headers)
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(10))
         .build()
-        .map_err(|e| AppError::Stash(e.to_string()))?;
+        .map_err(|e| AppError::Stash(e.to_string()))
+}
+
+fn client_for(settings: &Settings) -> Result<Client, AppError> {
+    build_client(&settings.api_key)
+}
+
+pub async fn test_connection(url: &str, api_key: &str) -> Result<bool, AppError> {
+    let client = build_client(api_key)?;
 
     let body = GraphQLRequest {
         query: "query { systemStatus { databaseSchema } }".into(),

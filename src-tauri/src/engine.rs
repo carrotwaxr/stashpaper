@@ -83,7 +83,8 @@ async fn rotate(
     rotation_state: &mut RotationState,
     app_handle: &tauri::AppHandle,
 ) -> Result<(), AppError> {
-    let s = settings.read().await;
+    // Clone settings and release the lock before network I/O
+    let s = settings.read().await.clone();
 
     let count = stash::query_image_count(&s).await?;
     if count == 0 {
