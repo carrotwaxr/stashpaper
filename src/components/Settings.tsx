@@ -20,6 +20,29 @@ const DEFAULT_SETTINGS: Settings = {
 
 type ConnectionStatus = "idle" | "testing" | "connected" | "failed";
 
+function SelectWrapper({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="relative">
+      {children}
+      <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-2">
+        <svg
+          className="h-4 w-4 text-zinc-400"
+          fill="none"
+          stroke="currentColor"
+          viewBox="0 0 24 24"
+        >
+          <path
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            strokeWidth={2}
+            d="M19 9l-7 7-7-7"
+          />
+        </svg>
+      </div>
+    </div>
+  );
+}
+
 export default function SettingsPanel() {
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [connectionStatus, setConnectionStatus] =
@@ -66,7 +89,7 @@ export default function SettingsPanel() {
   const inputClass =
     "w-full rounded bg-zinc-800 border border-zinc-700 px-3 py-2 text-zinc-100 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500";
   const selectClass =
-    "w-full rounded bg-zinc-800 border border-zinc-700 px-3 py-2 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-blue-500";
+    "w-full appearance-none rounded bg-zinc-800 border border-zinc-700 px-3 py-2 pr-8 text-zinc-100 focus:outline-none focus:ring-2 focus:ring-blue-500";
   const labelClass = "block text-sm font-medium text-zinc-400 mb-1";
   const sectionClass = "space-y-3";
   const headingClass = "text-lg font-semibold text-zinc-200";
@@ -141,42 +164,48 @@ export default function SettingsPanel() {
           <div className="grid grid-cols-2 gap-4">
             <div>
               <label className={labelClass}>Mode</label>
-              <select
-                className={selectClass}
-                value={settings.rotation_mode}
-                onChange={(e) =>
-                  update("rotation_mode", e.target.value as RotationMode)
-                }
-              >
-                {(
-                  Object.entries(ROTATION_MODE_LABELS) as [
-                    RotationMode,
-                    string,
-                  ][]
-                ).map(([value, label]) => (
-                  <option key={value} value={value}>
-                    {label}
-                  </option>
-                ))}
-              </select>
+              <SelectWrapper>
+                <select
+                  className={selectClass}
+                  style={{ color: "#f4f4f5", backgroundColor: "#27272a" }}
+                  value={settings.rotation_mode}
+                  onChange={(e) =>
+                    update("rotation_mode", e.target.value as RotationMode)
+                  }
+                >
+                  {(
+                    Object.entries(ROTATION_MODE_LABELS) as [
+                      RotationMode,
+                      string,
+                    ][]
+                  ).map(([value, label]) => (
+                    <option key={value} value={value} style={{ color: "#f4f4f5", backgroundColor: "#27272a" }}>
+                      {label}
+                    </option>
+                  ))}
+                </select>
+              </SelectWrapper>
             </div>
             <div>
               <label className={labelClass}>Interval</label>
-              <select
-                className={selectClass}
-                value={settings.interval}
-                onChange={(e) =>
-                  update("interval", e.target.value as Interval)
-                }
-              >
-                {(
-                  Object.entries(INTERVAL_LABELS) as [Interval, string][]
-                ).map(([value, label]) => (
-                  <option key={value} value={value}>
-                    {label}
-                  </option>
-                ))}
-              </select>
+              <SelectWrapper>
+                <select
+                  className={selectClass}
+                  style={{ color: "#f4f4f5", backgroundColor: "#27272a" }}
+                  value={settings.interval}
+                  onChange={(e) =>
+                    update("interval", e.target.value as Interval)
+                  }
+                >
+                  {(
+                    Object.entries(INTERVAL_LABELS) as [Interval, string][]
+                  ).map(([value, label]) => (
+                    <option key={value} value={value} style={{ color: "#f4f4f5", backgroundColor: "#27272a" }}>
+                      {label}
+                    </option>
+                  ))}
+                </select>
+              </SelectWrapper>
             </div>
           </div>
         </section>
@@ -186,21 +215,24 @@ export default function SettingsPanel() {
           <h2 className={headingClass}>Display</h2>
           <div>
             <label className={labelClass}>Fit Mode</label>
-            <select
-              className={selectClass}
-              value={settings.fit_mode}
-              onChange={(e) =>
-                update("fit_mode", e.target.value as FitMode)
-              }
-            >
-              {(
-                Object.entries(FIT_MODE_LABELS) as [FitMode, string][]
-              ).map(([value, label]) => (
-                <option key={value} value={value}>
-                  {label}
-                </option>
-              ))}
-            </select>
+            <SelectWrapper>
+              <select
+                className={selectClass}
+                style={{ color: "#f4f4f5", backgroundColor: "#27272a" }}
+                value={settings.fit_mode}
+                onChange={(e) =>
+                  update("fit_mode", e.target.value as FitMode)
+                }
+              >
+                {(
+                  Object.entries(FIT_MODE_LABELS) as [FitMode, string][]
+                ).map(([value, label]) => (
+                  <option key={value} value={value} style={{ color: "#f4f4f5", backgroundColor: "#27272a" }}>
+                    {label}
+                  </option>
+                ))}
+              </select>
+            </SelectWrapper>
           </div>
           <label className="flex items-center gap-2">
             <input
