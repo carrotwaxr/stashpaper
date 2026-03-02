@@ -115,12 +115,28 @@ async fn rotate(
         .to_str()
         .ok_or_else(|| AppError::Wallpaper("Invalid file path".into()))?;
 
-    // Set the wallpaper using the fit mode from settings
-    wallpaper::set_from_path(path_str)
+    set_wallpaper(path_str, &s)?;
+
+    Ok(())
+}
+
+fn set_wallpaper(path: &str, settings: &Settings) -> Result<(), AppError> {
+    // Set wallpaper via the wallpaper crate (handles most DEs)
+    wallpaper::set_from_path(path)
         .map_err(|e| AppError::Wallpaper(e.to_string()))?;
 
+    // GNOME dark mode fix: the wallpaper crate only sets picture-uri,
+    // but GNOME uses picture-uri-dark when color-scheme is prefer-dark
+    #[cfg(target_os = "linux")]
+    {
+        let uri = format!("file://{}", path);
+        let _ = std::process::Command::new("gsettings")
+            .args(["set", "org.gnome.desktop.background", "picture-uri-dark", &uri])
+            .output();
+    }
+
     // Set the wallpaper mode based on settings
-    let mode = match s.fit_mode {
+    let mode = match settings.fit_mode {
         crate::settings::FitMode::Center => wallpaper::Mode::Center,
         crate::settings::FitMode::Crop => wallpaper::Mode::Crop,
         crate::settings::FitMode::Fit => wallpaper::Mode::Fit,

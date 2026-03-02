@@ -203,7 +203,24 @@ pub async fn download_image(
     };
 
     std::fs::create_dir_all(cache_dir)?;
-    let file_path = cache_dir.join(format!("current_wallpaper.{}", ext));
+
+    // Use a unique filename so GNOME/KDE detect the wallpaper changed
+    // (they cache by path and may not notice the file content changed)
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let file_path = cache_dir.join(format!("wallpaper_{}.{}", timestamp, ext));
+
+    // Clean up old wallpaper files
+    if let Ok(entries) = std::fs::read_dir(cache_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with("wallpaper_") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
 
     let bytes = resp
         .bytes()
