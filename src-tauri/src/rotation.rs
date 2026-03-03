@@ -106,6 +106,19 @@ impl RotationState {
         })
     }
 
+    /// Select N next pages. Returns at most `min(n, count)` results.
+    pub fn select_next_batch(
+        &mut self,
+        mode: RotationMode,
+        count: usize,
+        n: usize,
+    ) -> Vec<RotationResult> {
+        let take = n.min(count);
+        (0..take)
+            .filter_map(|_| self.select_next(mode, count))
+            .collect()
+    }
+
     fn regenerate_shuffle(&mut self, count: usize) {
         let mut rng = rand::rng();
         self.shuffle_order = (1..=count).collect();
@@ -276,5 +289,31 @@ mod tests {
         let r = state.select_next(RotationMode::Random, 10).unwrap();
         assert!(r.random_seed.is_some());
         assert_eq!(r.page, 1);
+    }
+
+    #[test]
+    fn test_select_next_batch_returns_n_results() {
+        let mut state = RotationState::new();
+        let results = state.select_next_batch(RotationMode::Sequential, 10, 3);
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].page, 1);
+        assert_eq!(results[1].page, 2);
+        assert_eq!(results[2].page, 3);
+    }
+
+    #[test]
+    fn test_select_next_batch_single_is_same_as_select_next() {
+        let mut state1 = RotationState::new();
+        let mut state2 = RotationState::new();
+        let batch = state1.select_next_batch(RotationMode::Sequential, 10, 1);
+        let single = state2.select_next(RotationMode::Sequential, 10).unwrap();
+        assert_eq!(batch[0], single);
+    }
+
+    #[test]
+    fn test_select_next_batch_clamps_to_count() {
+        let mut state = RotationState::new();
+        let results = state.select_next_batch(RotationMode::Sequential, 3, 5);
+        assert_eq!(results.len(), 3);
     }
 }

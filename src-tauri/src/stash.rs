@@ -262,6 +262,18 @@ pub async fn test_query(settings: &Settings) -> Result<usize, AppError> {
         .unwrap_or(0))
 }
 
+/// Remove old wallpaper files from cache directory.
+pub fn clean_wallpaper_cache(cache_dir: &Path) {
+    if let Ok(entries) = std::fs::read_dir(cache_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with("wallpaper_") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
 pub async fn download_image(
     settings: &Settings,
     image_url: &str,
@@ -297,16 +309,6 @@ pub async fn download_image(
         .unwrap_or_default()
         .as_millis();
     let file_path = cache_dir.join(format!("wallpaper_{}.{}", timestamp, ext));
-
-    // Clean up old wallpaper files
-    if let Ok(entries) = std::fs::read_dir(cache_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            if name.to_string_lossy().starts_with("wallpaper_") {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-    }
 
     let bytes = resp
         .bytes()
