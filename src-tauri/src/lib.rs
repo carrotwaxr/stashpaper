@@ -3,6 +3,7 @@ mod error;
 mod rotation;
 mod settings;
 mod stash;
+mod compositor;
 
 use error::AppError;
 use settings::Settings;
