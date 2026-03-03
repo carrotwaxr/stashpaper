@@ -10,6 +10,8 @@ export type Interval =
 
 export type FitMode = "center" | "crop" | "fit" | "span" | "stretch" | "tile";
 
+export type MinResolution = "none" | "hd720" | "full_hd1080" | "qhd1440" | "uhd4k";
+
 export interface Settings {
   stash_url: string;
   api_key: string;
@@ -17,6 +19,7 @@ export interface Settings {
   rotation_mode: RotationMode;
   interval: Interval;
   fit_mode: FitMode;
+  min_resolution: MinResolution;
   per_monitor: boolean;
   wifi_only: boolean;
 }
@@ -34,6 +37,14 @@ export const ROTATION_MODE_LABELS: Record<RotationMode, string> = {
   random: "Random",
   sequential: "Sequential",
   shuffle: "Shuffle (no repeat)",
+};
+
+export const MIN_RESOLUTION_LABELS: Record<MinResolution, string> = {
+  none: "None",
+  hd720: "720p (HD)",
+  full_hd1080: "1080p (Full HD)",
+  qhd1440: "1440p (QHD)",
+  uhd4k: "4K (UHD)",
 };
 
 export const FIT_MODE_LABELS: Record<FitMode, string> = {

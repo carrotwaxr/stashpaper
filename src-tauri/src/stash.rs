@@ -100,11 +100,29 @@ pub async fn test_connection(url: &str, api_key: &str) -> Result<bool, AppError>
 
 /// Parse the combined query_filter JSON into separate filter and image_filter values,
 /// merging pagination (per_page, page) into the user's filter.
-fn build_variables(settings: &Settings, per_page: usize, page: usize) -> serde_json::Value {
+/// Optionally injects min_resolution and random seed sort.
+fn build_variables(
+    settings: &Settings,
+    per_page: usize,
+    page: usize,
+    random_seed: Option<u64>,
+) -> serde_json::Value {
     let parsed: serde_json::Value =
         serde_json::from_str(&settings.query_filter).unwrap_or(serde_json::json!({}));
 
-    let image_filter = parsed.get("image_filter").cloned().unwrap_or(serde_json::json!({}));
+    let mut image_filter = parsed
+        .get("image_filter")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+
+    // Inject min_resolution if set and user hasn't specified their own resolution filter
+    if let Some(resolution_filter) = settings.min_resolution.to_stash_filter() {
+        if let Some(obj) = image_filter.as_object_mut() {
+            if !obj.contains_key("resolution") {
+                obj.insert("resolution".into(), resolution_filter);
+            }
+        }
+    }
 
     // Start with user's filter, then override pagination
     let mut filter = match parsed.get("filter") {
@@ -114,6 +132,23 @@ fn build_variables(settings: &Settings, per_page: usize, page: usize) -> serde_j
     if let Some(obj) = filter.as_object_mut() {
         obj.insert("per_page".into(), serde_json::json!(per_page));
         obj.insert("page".into(), serde_json::json!(page));
+
+        // Inject random seed sort for no-repeat random rotation
+        if let Some(seed) = random_seed {
+            let seeded_sort = format!("random_{}", seed);
+            match obj.get("sort").and_then(|v| v.as_str()) {
+                // No sort specified — inject seeded random
+                None => {
+                    obj.insert("sort".into(), serde_json::json!(seeded_sort));
+                }
+                // User has "random" or already-seeded "random_<digits>" — replace with our seed
+                Some(s) if s == "random" || s.starts_with("random_") => {
+                    obj.insert("sort".into(), serde_json::json!(seeded_sort));
+                }
+                // User has a non-random sort (e.g. "rating", "date") — respect it
+                Some(_) => {}
+            }
+        }
     }
 
     serde_json::json!({
@@ -127,7 +162,7 @@ pub async fn query_image_count(settings: &Settings) -> Result<usize, AppError> {
 
     let body = GraphQLRequest {
         query: FIND_IMAGES_QUERY.into(),
-        variables: build_variables(settings, 1, 1),
+        variables: build_variables(settings, 1, 1, None),
     };
 
     let resp = client
@@ -158,12 +193,13 @@ pub async fn query_image_count(settings: &Settings) -> Result<usize, AppError> {
 pub async fn fetch_image_at_page(
     settings: &Settings,
     page: usize,
+    random_seed: Option<u64>,
 ) -> Result<Option<StashImage>, AppError> {
     let client = client_for(settings)?;
 
     let body = GraphQLRequest {
         query: FIND_IMAGES_QUERY.into(),
-        variables: build_variables(settings, 1, page),
+        variables: build_variables(settings, 1, page, random_seed),
     };
 
     let resp = client
@@ -188,6 +224,41 @@ pub async fn fetch_image_at_page(
     Ok(gql
         .data
         .and_then(|d| d.find_images.images.into_iter().next()))
+}
+
+/// Test a query with the given settings, returning the image count.
+/// Uses all mutations (min_resolution, etc.) but no seed.
+pub async fn test_query(settings: &Settings) -> Result<usize, AppError> {
+    let client = client_for(settings)?;
+
+    let body = GraphQLRequest {
+        query: FIND_IMAGES_QUERY.into(),
+        variables: build_variables(settings, 0, 1, None),
+    };
+
+    let resp = client
+        .post(format!(
+            "{}/graphql",
+            settings.stash_url.trim_end_matches('/')
+        ))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| AppError::Stash(e.to_string()))?;
+
+    let gql: GraphQLResponse<FindImagesData> =
+        resp.json().await.map_err(|e| AppError::Stash(e.to_string()))?;
+
+    if let Some(errors) = gql.errors {
+        if let Some(err) = errors.first() {
+            return Err(AppError::Stash(err.message.clone()));
+        }
+    }
+
+    Ok(gql
+        .data
+        .map(|d| d.find_images.count)
+        .unwrap_or(0))
 }
 
 pub async fn download_image(
@@ -248,6 +319,7 @@ pub async fn download_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::MinResolution;
 
     #[test]
     fn test_graphql_request_serialization() {
@@ -306,7 +378,7 @@ mod tests {
             query_filter: "{}".into(),
             ..Settings::default()
         };
-        let vars = build_variables(&settings, 1, 5);
+        let vars = build_variables(&settings, 1, 5, None);
         assert_eq!(vars["filter"]["per_page"], 1);
         assert_eq!(vars["filter"]["page"], 5);
         assert!(vars["image_filter"].is_object());
@@ -326,8 +398,8 @@ mod tests {
             }"#.into(),
             ..Settings::default()
         };
-        let vars = build_variables(&settings, 1, 3);
-        // User's sort/direction preserved
+        let vars = build_variables(&settings, 1, 3, None);
+        // User's sort/direction preserved (no seed passed)
         assert_eq!(vars["filter"]["sort"], "random");
         assert_eq!(vars["filter"]["direction"], "DESC");
         // Pagination merged in
@@ -346,8 +418,86 @@ mod tests {
             query_filter: r#"{"image_filter": {"tags": {"value": ["wallpaper"], "modifier": "INCLUDES_ALL"}}}"#.into(),
             ..Settings::default()
         };
-        let vars = build_variables(&settings, 1, 1);
+        let vars = build_variables(&settings, 1, 1, None);
         assert!(vars["image_filter"]["tags"]["value"].is_array());
         assert_eq!(vars["filter"]["per_page"], 1);
+    }
+
+    #[test]
+    fn test_build_variables_injects_min_resolution() {
+        let settings = Settings {
+            stash_url: "http://localhost:9999".into(),
+            api_key: "key".into(),
+            query_filter: r#"{"image_filter": {}}"#.into(),
+            min_resolution: MinResolution::FullHd1080,
+            ..Settings::default()
+        };
+        let vars = build_variables(&settings, 1, 1, None);
+        assert_eq!(vars["image_filter"]["resolution"]["value"], "STANDARD_HD");
+        assert_eq!(vars["image_filter"]["resolution"]["modifier"], "GREATER_THAN");
+    }
+
+    #[test]
+    fn test_build_variables_no_override_user_resolution() {
+        let settings = Settings {
+            stash_url: "http://localhost:9999".into(),
+            api_key: "key".into(),
+            query_filter: r#"{"image_filter": {"resolution": {"value": "FOUR_K", "modifier": "EQUALS"}}}"#.into(),
+            min_resolution: MinResolution::Hd720,
+            ..Settings::default()
+        };
+        let vars = build_variables(&settings, 1, 1, None);
+        // User's resolution filter preserved, not overridden by min_resolution
+        assert_eq!(vars["image_filter"]["resolution"]["value"], "FOUR_K");
+        assert_eq!(vars["image_filter"]["resolution"]["modifier"], "EQUALS");
+    }
+
+    #[test]
+    fn test_build_variables_with_random_seed() {
+        let settings = Settings {
+            stash_url: "http://localhost:9999".into(),
+            api_key: "key".into(),
+            query_filter: "{}".into(),
+            ..Settings::default()
+        };
+        let vars = build_variables(&settings, 1, 1, Some(42));
+        assert_eq!(vars["filter"]["sort"], "random_42");
+    }
+
+    #[test]
+    fn test_build_variables_seed_replaces_random_sort() {
+        let settings = Settings {
+            stash_url: "http://localhost:9999".into(),
+            api_key: "key".into(),
+            query_filter: r#"{"filter": {"sort": "random"}}"#.into(),
+            ..Settings::default()
+        };
+        let vars = build_variables(&settings, 1, 1, Some(99));
+        assert_eq!(vars["filter"]["sort"], "random_99");
+    }
+
+    #[test]
+    fn test_build_variables_seed_replaces_existing_seeded_sort() {
+        let settings = Settings {
+            stash_url: "http://localhost:9999".into(),
+            api_key: "key".into(),
+            query_filter: r#"{"filter": {"sort": "random_12345"}}"#.into(),
+            ..Settings::default()
+        };
+        let vars = build_variables(&settings, 1, 1, Some(99));
+        assert_eq!(vars["filter"]["sort"], "random_99");
+    }
+
+    #[test]
+    fn test_build_variables_seed_respects_non_random_sort() {
+        let settings = Settings {
+            stash_url: "http://localhost:9999".into(),
+            api_key: "key".into(),
+            query_filter: r#"{"filter": {"sort": "rating"}}"#.into(),
+            ..Settings::default()
+        };
+        let vars = build_variables(&settings, 1, 1, Some(99));
+        // User's non-random sort should be preserved
+        assert_eq!(vars["filter"]["sort"], "rating");
     }
 }

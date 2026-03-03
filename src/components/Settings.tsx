@@ -1,10 +1,17 @@
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { Settings, RotationMode, Interval, FitMode } from "../lib/types";
+import type {
+  Settings,
+  RotationMode,
+  Interval,
+  FitMode,
+  MinResolution,
+} from "../lib/types";
 import {
   INTERVAL_LABELS,
   ROTATION_MODE_LABELS,
   FIT_MODE_LABELS,
+  MIN_RESOLUTION_LABELS,
 } from "../lib/types";
 
 const DEFAULT_SETTINGS: Settings = {
@@ -14,11 +21,19 @@ const DEFAULT_SETTINGS: Settings = {
   rotation_mode: "random",
   interval: "thirty_minutes",
   fit_mode: "crop",
+  min_resolution: "none",
   per_monitor: false,
   wifi_only: false,
 };
 
 type ConnectionStatus = "idle" | "testing" | "connected" | "failed";
+type MonitorResolution = { width: number; height: number } | null;
+type TestQueryResult =
+  | { status: "idle" }
+  | { status: "testing" }
+  | { status: "success"; count: number }
+  | { status: "zero" }
+  | { status: "error"; error: string };
 
 function SelectWrapper({ children }: { children: React.ReactNode }) {
   return (
@@ -48,6 +63,10 @@ export default function SettingsPanel() {
   const [connectionStatus, setConnectionStatus] =
     useState<ConnectionStatus>("idle");
   const [saved, setSaved] = useState(false);
+  const [monitorRes, setMonitorRes] = useState<MonitorResolution>(null);
+  const [testResult, setTestResult] = useState<TestQueryResult>({
+    status: "idle",
+  });
 
   useEffect(() => {
     invoke<Settings>("get_settings")
@@ -57,10 +76,17 @@ export default function SettingsPanel() {
       .catch(() => {
         // Use defaults if no settings loaded yet
       });
+    invoke<MonitorResolution>("detect_monitor_resolution")
+      .then(setMonitorRes)
+      .catch(() => {});
   }, []);
 
   function update<K extends keyof Settings>(key: K, value: Settings[K]) {
     setSettings((prev) => ({ ...prev, [key]: value }));
+    // Reset test result when query-affecting fields change
+    if (key === "query_filter" || key === "min_resolution") {
+      setTestResult({ status: "idle" });
+    }
   }
 
   async function testConnection() {
@@ -83,6 +109,25 @@ export default function SettingsPanel() {
       setTimeout(() => setSaved(false), 2000);
     } catch (err) {
       console.error("Failed to save settings:", err);
+    }
+  }
+
+  async function testQuery() {
+    setTestResult({ status: "testing" });
+    try {
+      const count = await invoke<number>("test_query", {
+        newSettings: settings,
+      });
+      if (count > 0) {
+        setTestResult({ status: "success", count });
+      } else {
+        setTestResult({ status: "zero" });
+      }
+    } catch (err) {
+      setTestResult({
+        status: "error",
+        error: String(err),
+      });
     }
   }
 
@@ -174,6 +219,38 @@ export default function SettingsPanel() {
           ) : settings.query_filter.trim() ? (
             <p className="text-xs text-green-400 mt-1">Valid JSON</p>
           ) : null}
+          <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={testQuery}
+              disabled={
+                !!queryFilterError ||
+                testResult.status === "testing" ||
+                !settings.stash_url ||
+                !settings.api_key
+              }
+              className="rounded bg-zinc-700 px-4 py-2 text-sm font-medium text-zinc-100 hover:bg-zinc-600 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {testResult.status === "testing"
+                ? "Testing..."
+                : "Test Query"}
+            </button>
+            {testResult.status === "success" && (
+              <span className="text-sm text-green-400">
+                Found {testResult.count} image{testResult.count !== 1 ? "s" : ""}
+              </span>
+            )}
+            {testResult.status === "zero" && (
+              <span className="text-sm text-red-400">
+                No images found — check your filter
+              </span>
+            )}
+            {testResult.status === "error" && (
+              <span className="text-sm text-red-400">
+                {testResult.error}
+              </span>
+            )}
+          </div>
         </section>
 
         {/* Rotation */}
@@ -231,6 +308,39 @@ export default function SettingsPanel() {
         {/* Display */}
         <section className={sectionClass}>
           <h2 className={headingClass}>Display</h2>
+          <div>
+            <label className={labelClass}>Minimum Resolution</label>
+            <SelectWrapper>
+              <select
+                className={selectClass}
+                style={{ color: "#f4f4f5", backgroundColor: "#27272a" }}
+                value={settings.min_resolution}
+                onChange={(e) =>
+                  update("min_resolution", e.target.value as MinResolution)
+                }
+              >
+                {(
+                  Object.entries(MIN_RESOLUTION_LABELS) as [
+                    MinResolution,
+                    string,
+                  ][]
+                ).map(([value, label]) => (
+                  <option
+                    key={value}
+                    value={value}
+                    style={{ color: "#f4f4f5", backgroundColor: "#27272a" }}
+                  >
+                    {label}
+                  </option>
+                ))}
+              </select>
+            </SelectWrapper>
+            {monitorRes && (
+              <p className="text-xs text-zinc-500 mt-1">
+                Your monitor: {monitorRes.width}x{monitorRes.height}
+              </p>
+            )}
+          </div>
           <div>
             <label className={labelClass}>Fit Mode</label>
             <SelectWrapper>
@@ -290,10 +400,16 @@ export default function SettingsPanel() {
         <button
           type="button"
           onClick={saveSettings}
-          disabled={!!queryFilterError}
+          disabled={!!queryFilterError || testResult.status === "zero"}
           className="w-full rounded bg-blue-600 px-4 py-2.5 font-medium text-white hover:bg-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:ring-offset-zinc-900 disabled:opacity-50 disabled:cursor-not-allowed"
         >
-          {saved ? "Saved!" : queryFilterError ? "Fix JSON to Save" : "Save Settings"}
+          {saved
+            ? "Saved!"
+            : queryFilterError
+              ? "Fix JSON to Save"
+              : testResult.status === "zero"
+                ? "No Images Found"
+                : "Save Settings"}
         </button>
       </div>
     </div>

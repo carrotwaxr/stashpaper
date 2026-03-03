@@ -73,8 +73,14 @@ async fn do_rotate(
     rotation_state: &mut RotationState,
     app_handle: &tauri::AppHandle,
 ) {
-    if let Err(e) = rotate(settings, rotation_state, app_handle).await {
-        eprintln!("[StashPaper] Rotation error: {}", e);
+    match rotate(settings, rotation_state, app_handle).await {
+        Ok(()) => {
+            crate::update_tray_icon(app_handle, false, None);
+        }
+        Err(e) => {
+            eprintln!("[StashPaper] Rotation error: {}", e);
+            crate::update_tray_icon(app_handle, true, Some(&e.to_string()));
+        }
     }
 }
 
@@ -88,14 +94,14 @@ async fn rotate(
 
     let count = stash::query_image_count(&s).await?;
     if count == 0 {
-        return Ok(());
+        return Err(AppError::Stash("No images found".into()));
     }
 
-    let page = rotation_state
+    let result = rotation_state
         .select_next(s.rotation_mode, count)
         .ok_or_else(|| AppError::Stash("No images found".into()))?;
 
-    let image = stash::fetch_image_at_page(&s, page)
+    let image = stash::fetch_image_at_page(&s, result.page, result.random_seed)
         .await?
         .ok_or_else(|| AppError::Stash("Image not found at page".into()))?;
 

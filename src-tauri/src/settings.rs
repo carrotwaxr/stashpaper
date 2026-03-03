@@ -14,6 +14,7 @@ pub struct Settings {
     pub rotation_mode: RotationMode,
     pub interval: Interval,
     pub fit_mode: FitMode,
+    pub min_resolution: MinResolution,
     pub per_monitor: bool,
     pub wifi_only: bool,
 }
@@ -48,6 +49,35 @@ pub enum Interval {
     Daily,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MinResolution {
+    #[default]
+    None,
+    Hd720,
+    FullHd1080,
+    Qhd1440,
+    Uhd4k,
+}
+
+impl MinResolution {
+    /// Returns the Stash `image_filter.resolution` criterion JSON for this minimum,
+    /// or `None` if no filtering is requested.
+    pub fn to_stash_filter(&self) -> Option<serde_json::Value> {
+        let bucket = match self {
+            MinResolution::None => return Option::None,
+            MinResolution::Hd720 => "WEB_HD",
+            MinResolution::FullHd1080 => "STANDARD_HD",
+            MinResolution::Qhd1440 => "FULL_HD",
+            MinResolution::Uhd4k => "QUAD_HD",
+        };
+        Some(serde_json::json!({
+            "value": bucket,
+            "modifier": "GREATER_THAN"
+        }))
+    }
+}
+
 impl Interval {
     pub fn to_duration(self) -> Duration {
         match self {
@@ -70,6 +100,7 @@ impl Default for Settings {
             rotation_mode: RotationMode::Random,
             interval: Interval::ThirtyMinutes,
             fit_mode: FitMode::Crop,
+            min_resolution: MinResolution::None,
             per_monitor: false,
             wifi_only: false,
         }
@@ -133,6 +164,7 @@ mod tests {
             rotation_mode: RotationMode::Shuffle,
             interval: Interval::OneHour,
             fit_mode: FitMode::Crop,
+            min_resolution: MinResolution::None,
             per_monitor: true,
             wifi_only: false,
         };
@@ -187,6 +219,36 @@ mod tests {
         }"#;
         let settings: Settings = serde_json::from_str(json).unwrap();
         assert_eq!(settings.stash_url, "http://localhost:9999");
+    }
+
+    #[test]
+    fn test_min_resolution_serde_roundtrip() {
+        let settings = Settings {
+            min_resolution: MinResolution::FullHd1080,
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains("\"full_hd1080\""));
+        let deserialized: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.min_resolution, MinResolution::FullHd1080);
+    }
+
+    #[test]
+    fn test_min_resolution_to_stash_filter() {
+        assert!(MinResolution::None.to_stash_filter().is_none());
+
+        let filter = MinResolution::Hd720.to_stash_filter().unwrap();
+        assert_eq!(filter["value"], "WEB_HD");
+        assert_eq!(filter["modifier"], "GREATER_THAN");
+
+        let filter = MinResolution::FullHd1080.to_stash_filter().unwrap();
+        assert_eq!(filter["value"], "STANDARD_HD");
+
+        let filter = MinResolution::Qhd1440.to_stash_filter().unwrap();
+        assert_eq!(filter["value"], "FULL_HD");
+
+        let filter = MinResolution::Uhd4k.to_stash_filter().unwrap();
+        assert_eq!(filter["value"], "QUAD_HD");
     }
 
     #[test]
