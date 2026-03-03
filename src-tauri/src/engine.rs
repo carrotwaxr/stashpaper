@@ -178,7 +178,11 @@ async fn rotate(
 
     if s.per_monitor && monitors.len() > 1 {
         // Composite and set as spanned wallpaper
-        let composite_path = cache_dir.join("composite_wallpaper.png");
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let composite_path = cache_dir.join(format!("wallpaper_composite_{}.png", timestamp));
         let geoms: Vec<crate::compositor::MonitorGeometry> = monitors
             .iter()
             .map(|m| crate::compositor::MonitorGeometry {
@@ -211,13 +215,25 @@ fn set_wallpaper(path: &str, settings: &Settings) -> Result<(), AppError> {
     wallpaper::set_from_path(path)
         .map_err(|e| AppError::Wallpaper(e.to_string()))?;
 
-    // GNOME dark mode fix: the wallpaper crate only sets picture-uri,
-    // but GNOME uses picture-uri-dark when color-scheme is prefer-dark
+    // GNOME fixes: set picture-uri-dark for dark mode, and picture-options
+    // to match fit_mode (important if switching back from per-monitor/spanned)
     #[cfg(target_os = "linux")]
     {
         let uri = format!("file://{}", path);
         let _ = std::process::Command::new("gsettings")
             .args(["set", "org.gnome.desktop.background", "picture-uri-dark", &uri])
+            .output();
+
+        let gnome_option = match settings.fit_mode {
+            crate::settings::FitMode::Center => "centered",
+            crate::settings::FitMode::Crop => "zoom",
+            crate::settings::FitMode::Fit => "scaled",
+            crate::settings::FitMode::Span => "spanned",
+            crate::settings::FitMode::Stretch => "stretched",
+            crate::settings::FitMode::Tile => "wallpaper",
+        };
+        let _ = std::process::Command::new("gsettings")
+            .args(["set", "org.gnome.desktop.background", "picture-options", gnome_option])
             .output();
     }
 

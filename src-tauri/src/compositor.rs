@@ -14,7 +14,7 @@ pub struct MonitorGeometry {
 ///
 /// The image is scaled so that the smaller dimension matches the target, then the
 /// overflowing dimension is center-cropped.
-pub fn crop_to_fill(img: &DynamicImage, target_w: u32, target_h: u32) -> RgbaImage {
+fn crop_to_fill(img: &DynamicImage, target_w: u32, target_h: u32) -> RgbaImage {
     let (src_w, src_h) = img.dimensions();
 
     // Calculate scale factor: we need to cover the entire target area,
