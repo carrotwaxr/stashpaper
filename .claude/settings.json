@@ -1,0 +1,83 @@
+{
+  "name": "StashPaper",
+  "description": "Desktop wallpaper rotator for Stash media server",
+  "permissions": {
+    "bash": {
+      "enabled": true,
+      "autoApprove": [
+        "git status",
+        "git diff",
+        "git log",
+        "git branch",
+        "git add",
+        "git commit",
+        "git push",
+        "git tag",
+        "git show",
+        "cargo test",
+        "cargo build",
+        "cargo check",
+        "cargo clippy",
+        "cargo fmt",
+        "cargo tauri dev",
+        "cargo tauri build",
+        "npm run build",
+        "npm run dev",
+        "npx tsc",
+        "ls",
+        "pwd",
+        "cat",
+        "find",
+        "grep"
+      ]
+    },
+    "edit": {
+      "enabled": true,
+      "autoApprove": true
+    },
+    "write": {
+      "enabled": true,
+      "autoApprove": false,
+      "requireConfirmation": [
+        "Cargo.toml",
+        "package.json",
+        "tauri.conf.json",
+        ".env*"
+      ]
+    },
+    "read": {
+      "enabled": true,
+      "autoApprove": true
+    }
+  },
+  "conventions": {
+    "branchNaming": {
+      "pattern": "(feature|bugfix|hotfix|improvement|chore)/*",
+      "examples": [
+        "feature/multi-monitor-support",
+        "bugfix/fix-gnome-dark-mode",
+        "improvement/optimize-image-cache"
+      ]
+    },
+    "commitMessages": {
+      "format": "conventional",
+      "types": ["feat", "fix", "docs", "refactor", "perf", "test", "chore"],
+      "includeCoAuthor": true
+    },
+    "testing": {
+      "runBeforeCommit": true,
+      "framework": "cargo test"
+    }
+  },
+  "workflows": {
+    "beforeCommit": [
+      "Run Rust tests (cd src-tauri && cargo test)",
+      "TypeScript compiles (npx tsc --noEmit)",
+      "Frontend builds (npm run build)"
+    ],
+    "beforePR": [
+      "All beforeCommit checks pass",
+      "Self-review completed"
+    ]
+  }
+}
