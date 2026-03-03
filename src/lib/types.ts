@@ -12,6 +12,14 @@ export type FitMode = "center" | "crop" | "fit" | "span" | "stretch" | "tile";
 
 export type MinResolution = "none" | "hd720" | "full_hd1080" | "qhd1440" | "uhd4k";
 
+export interface MonitorInfo {
+  width: number;
+  height: number;
+  x: number;
+  y: number;
+  scale_factor: number;
+}
+
 export interface Settings {
   stash_url: string;
   api_key: string;

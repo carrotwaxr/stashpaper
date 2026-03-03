@@ -6,6 +6,7 @@ import type {
   Interval,
   FitMode,
   MinResolution,
+  MonitorInfo,
 } from "../lib/types";
 import {
   INTERVAL_LABELS,
@@ -27,7 +28,6 @@ const DEFAULT_SETTINGS: Settings = {
 };
 
 type ConnectionStatus = "idle" | "testing" | "connected" | "failed";
-type MonitorResolution = { width: number; height: number } | null;
 type TestQueryResult =
   | { status: "idle" }
   | { status: "testing" }
@@ -63,7 +63,7 @@ export default function SettingsPanel() {
   const [connectionStatus, setConnectionStatus] =
     useState<ConnectionStatus>("idle");
   const [saved, setSaved] = useState(false);
-  const [monitorRes, setMonitorRes] = useState<MonitorResolution>(null);
+  const [monitors, setMonitors] = useState<MonitorInfo[]>([]);
   const [testResult, setTestResult] = useState<TestQueryResult>({
     status: "idle",
   });
@@ -76,8 +76,8 @@ export default function SettingsPanel() {
       .catch(() => {
         // Use defaults if no settings loaded yet
       });
-    invoke<MonitorResolution>("detect_monitor_resolution")
-      .then(setMonitorRes)
+    invoke<MonitorInfo[]>("detect_monitors")
+      .then(setMonitors)
       .catch(() => {});
   }, []);
 
@@ -335,9 +335,11 @@ export default function SettingsPanel() {
                 ))}
               </select>
             </SelectWrapper>
-            {monitorRes && (
+            {monitors.length > 0 && (
               <p className="text-xs text-zinc-500 mt-1">
-                Your monitor: {monitorRes.width}x{monitorRes.height}
+                {monitors.length === 1
+                  ? `Your monitor: ${monitors[0].width}x${monitors[0].height}`
+                  : `Monitors: ${monitors.map((m) => `${m.width}x${m.height}`).join(", ")}`}
               </p>
             )}
           </div>
@@ -372,11 +374,17 @@ export default function SettingsPanel() {
             <span className="text-sm text-zinc-300">
               Different wallpaper per monitor
             </span>
-            <span className="text-xs text-zinc-500">(coming soon)</span>
           </label>
-          <p className="text-xs text-zinc-500 ml-6">
-            Per-monitor support varies by platform and desktop environment.
-          </p>
+          {monitors.length > 1 && settings.per_monitor && (
+            <p className="text-xs text-zinc-500 ml-6">
+              {monitors.length} monitors detected: {monitors.map((m) => `${m.width}x${m.height}`).join(" + ")}
+            </p>
+          )}
+          {monitors.length <= 1 && settings.per_monitor && (
+            <p className="text-xs text-zinc-500 ml-6">
+              Only 1 monitor detected — per-monitor has no effect.
+            </p>
+          )}
         </section>
 
         {/* Network */}
