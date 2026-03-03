@@ -107,7 +107,6 @@ impl RotationState {
     }
 
     /// Select N next pages. Returns at most `min(n, count)` results.
-    #[allow(dead_code)] // Will be used by engine for multi-monitor support
     pub fn select_next_batch(
         &mut self,
         mode: RotationMode,

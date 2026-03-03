@@ -1,6 +1,3 @@
-// TODO: Remove once compositor is wired into engine.rs
-#![allow(dead_code)]
-
 use crate::error::AppError;
 use image::{DynamicImage, GenericImageView, RgbaImage};
 use std::path::{Path, PathBuf};

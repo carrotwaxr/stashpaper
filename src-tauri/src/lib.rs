@@ -18,6 +18,15 @@ use tokio::sync::RwLock;
 
 const TRAY_ID: &str = "main-tray";
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MonitorInfo {
+    pub width: u32,
+    pub height: u32,
+    pub x: i32,
+    pub y: i32,
+    pub scale_factor: f64,
+}
+
 struct AppState {
     settings: Arc<RwLock<Settings>>,
     engine_tx: engine::CommandTx,
@@ -137,6 +146,28 @@ async fn detect_monitor_resolution(app: tauri::AppHandle) -> Option<MonitorResol
 }
 
 #[tauri::command]
+async fn detect_monitors(app: tauri::AppHandle) -> Vec<MonitorInfo> {
+    app.available_monitors()
+        .map(|monitors| {
+            monitors
+                .into_iter()
+                .map(|m| {
+                    let size = m.size();
+                    let pos = m.position();
+                    MonitorInfo {
+                        width: size.width,
+                        height: size.height,
+                        x: pos.x,
+                        y: pos.y,
+                        scale_factor: m.scale_factor(),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tauri::command]
 async fn test_query(new_settings: Settings) -> Result<usize, AppError> {
     stash::test_query(&new_settings).await
 }
@@ -191,6 +222,7 @@ pub fn run() {
             test_connection,
             test_query,
             detect_monitor_resolution,
+            detect_monitors,
             next_wallpaper,
             pause_rotation,
             resume_rotation,
