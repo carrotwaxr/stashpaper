@@ -29,6 +29,7 @@ pub struct FindImagesResult {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct StashImage {
+    #[allow(dead_code)]
     pub id: String,
     pub paths: ImagePaths,
 }

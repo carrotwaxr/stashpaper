@@ -63,7 +63,7 @@ pub enum MinResolution {
 impl MinResolution {
     /// Returns the Stash `image_filter.resolution` criterion JSON for this minimum,
     /// or `None` if no filtering is requested.
-    pub fn to_stash_filter(&self) -> Option<serde_json::Value> {
+    pub fn to_stash_filter(self) -> Option<serde_json::Value> {
         let bucket = match self {
             MinResolution::None => return Option::None,
             MinResolution::Hd720 => "WEB_HD",

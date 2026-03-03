@@ -196,7 +196,7 @@ pub fn run() {
         ])
         .setup(|app| {
             // Load settings
-            let loaded = settings::load(&app.handle())?;
+            let loaded = settings::load(app.handle())?;
             let first_run = !settings::is_configured(&loaded);
             let shared_settings = Arc::new(RwLock::new(loaded));
 
