@@ -91,24 +91,22 @@ Query pattern: `findImages(filter: $filter, image_filter: $image_filter)` where 
 
 | Area | Skill | What it covers |
 |------|-------|----------------|
-| **Stash API** | `stash` | GraphQL API, plugin system, scraper system |
-| **Stash-Box** | `stash-box` | StashDB metadata API, edit/voting workflow, fingerprints |
-| **GraphQL** | `graphql-patterns` | Query patterns, codegen, Stash ecosystem |
-| **UI styling** | `tailwind-css-patterns` | Utility-first patterns, responsive design |
+| **Stash API** | `stash:stash` | GraphQL API, plugin system, scraper system |
+| **Stash-Box** | `stash:stash-box` | StashDB metadata API, edit/voting workflow, fingerprints |
 | **Frontend** | `frontend-design` | Component design, polish, avoiding generic AI aesthetics |
-| **Git workflow** | `git-preferences` | Commit conventions, branching, PR workflow |
+| **Git workflow** | `fluffer:git-pr` | Commit conventions, branching, PR workflow |
 | **Testing (Rust)** | — | `cargo test` in src-tauri; unit tests for rotation, stash, settings |
 
 ## Development Lifecycle
 
 ### Working on changes
 
-1. **Orient** → Read CLAUDE.md, check git status, check brain for prior context
-2. **Plan** → For non-trivial work, use `superpowers:writing-plans` or `EnterPlanMode`
+1. **Orient** → Read CLAUDE.md, check git status, check memory for prior context
+2. **Plan** → For non-trivial work, use `fluffer:plan-write` or `EnterPlanMode`
 3. **Implement** → Write code, run `cargo test` and `npx tsc --noEmit` frequently
-4. **Verify** → `superpowers:verification-before-completion` (evidence before claims)
-5. **Review** → `superpowers:requesting-code-review` for self-review
-6. **Complete** → `superpowers:finishing-a-development-branch`
+4. **Verify** → run the checks and show the output (`/fluffer:code-verify`)
+5. **Review** → `/fluffer:code-review` for a review team before the PR
+6. **Complete** → finish the branch as `fluffer:git-pr` describes
 
 ### Lifecycle Gates
 

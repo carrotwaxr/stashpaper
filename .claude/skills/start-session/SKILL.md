@@ -49,16 +49,11 @@ git log --oneline -10 --format="%h %s (%ar)"
 git stash list
 ```
 
-## Step 2b: Query the Brain
+## Step 2b: Check Memory
 
-Search the MCP memory service for context relevant to the branch topic:
+Auto-memory for this project is already loaded. Skim it for prior decisions, known gotchas in the area being worked on, and patterns from earlier sessions, and read any memory file it points to that matches the branch topic.
 
-```
-memory_search(query: "<branch-topic-keywords>", limit: 5)
-memory_search(query: "gotchas stashpaper", limit: 5)
-```
-
-Look for prior decisions, known gotchas, patterns established in previous sessions.
+Include what's relevant in the briefing under a "Memory Context" section.
 
 ## Step 3: Check Project Health
 
@@ -117,15 +112,15 @@ Wait for human confirmation before proceeding to any code changes.
 
 | Topic keywords | Skills to suggest |
 |---------------|-------------------|
-| stash, graphql, query, api | `stash`, `graphql-patterns` |
-| ui, settings, component, tailwind | `tailwind-css-patterns`, `frontend-design` |
+| stash, graphql, query, api | `stash:stash` |
+| ui, settings, component, tailwind | `frontend-design` |
 | rotation, engine, timer, wallpaper | (Rust core — no specific skill, use `cargo test`) |
 | tray, window, tauri | (Tauri-specific — check Tauri v2 docs) |
-| build, release, deploy | `git-preferences` |
+| build, release, deploy | `fluffer:git-pr` |
 
 ## What This Skill Does NOT Do
 
 - Does not make decisions about what to work on (that's the human's call)
 - Does not start coding (wait for confirmation)
-- Does not replace `work-ticket` (which handles the full ticket lifecycle)
-- Queries brain for context but does not store new memories
+- Does not replace `/stash:work-ticket` (which handles the full ticket lifecycle)
+- Reads memory for context but does not write new memories
