@@ -83,6 +83,9 @@ async fn save_settings(
     state: tauri::State<'_, AppState>,
     new_settings: Settings,
 ) -> Result<(), AppError> {
+    // Refuse a filter the engine couldn't apply, rather than save it and fail
+    // every rotation after
+    stash::parse_query_filter(&new_settings.query_filter)?;
     settings::save(&app, &new_settings)?;
     *state.settings.write().await = new_settings;
     state

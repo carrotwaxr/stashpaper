@@ -11,6 +11,9 @@ pub enum AppError {
     #[error("Settings error: {0}")]
     Settings(String),
 
+    #[error("Query filter: {0}")]
+    Filter(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }

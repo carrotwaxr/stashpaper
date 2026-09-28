@@ -63,6 +63,7 @@ export default function SettingsPanel() {
   const [connectionStatus, setConnectionStatus] =
     useState<ConnectionStatus>("idle");
   const [saved, setSaved] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const [monitors, setMonitors] = useState<MonitorInfo[]>([]);
   const [testResult, setTestResult] = useState<TestQueryResult>({
     status: "idle",
@@ -83,6 +84,7 @@ export default function SettingsPanel() {
 
   function update<K extends keyof Settings>(key: K, value: Settings[K]) {
     setSettings((prev) => ({ ...prev, [key]: value }));
+    setSaveError(null);
     // Reset test result when query-affecting fields change
     if (key === "query_filter" || key === "min_resolution") {
       setTestResult({ status: "idle" });
@@ -103,12 +105,13 @@ export default function SettingsPanel() {
   }
 
   async function saveSettings() {
+    setSaveError(null);
     try {
       await invoke("save_settings", { newSettings: settings });
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     } catch (err) {
-      console.error("Failed to save settings:", err);
+      setSaveError(String(err));
     }
   }
 
@@ -131,15 +134,28 @@ export default function SettingsPanel() {
     }
   }
 
+  // Mirrors parse_query_filter in stash.rs, which has the final say on save
   const queryFilterError = useMemo(() => {
     const raw = settings.query_filter.trim();
     if (!raw) return null;
+    let parsed: unknown;
     try {
-      JSON.parse(raw);
-      return null;
+      parsed = JSON.parse(raw);
     } catch (e) {
-      return (e as SyntaxError).message;
+      return `Not valid JSON (${(e as SyntaxError).message})`;
     }
+    const isObject = (v: unknown) =>
+      typeof v === "object" && v !== null && !Array.isArray(v);
+    if (!isObject(parsed)) {
+      return "Must be a JSON object with filter and/or image_filter";
+    }
+    for (const [key, value] of Object.entries(parsed as object)) {
+      if (key !== "filter" && key !== "image_filter") {
+        return `Unknown key "${key}", use filter and/or image_filter`;
+      }
+      if (!isObject(value)) return `"${key}" must be a JSON object`;
+    }
+    return null;
   }, [settings.query_filter]);
 
   const inputClass =
@@ -215,9 +231,9 @@ export default function SettingsPanel() {
             onChange={(e) => update("query_filter", e.target.value)}
           />
           {queryFilterError ? (
-            <p className="text-xs text-red-400 mt-1">Invalid JSON: {queryFilterError}</p>
+            <p className="text-xs text-red-400 mt-1">{queryFilterError}</p>
           ) : settings.query_filter.trim() ? (
-            <p className="text-xs text-green-400 mt-1">Valid JSON</p>
+            <p className="text-xs text-green-400 mt-1">Filter format OK</p>
           ) : null}
           <div className="flex items-center gap-3">
             <button
@@ -414,11 +430,12 @@ export default function SettingsPanel() {
           {saved
             ? "Saved!"
             : queryFilterError
-              ? "Fix JSON to Save"
+              ? "Fix Filter to Save"
               : testResult.status === "zero"
                 ? "No Images Found"
                 : "Save Settings"}
         </button>
+        {saveError && <p className="text-sm text-red-400">{saveError}</p>}
       </div>
     </div>
   );

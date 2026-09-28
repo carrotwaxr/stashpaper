@@ -2,6 +2,8 @@ use crate::error::AppError;
 use crate::rotation::RotationState;
 use crate::settings::Settings;
 use crate::stash;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::Manager;
 use tokio::sync::{mpsc, RwLock};
@@ -25,6 +27,9 @@ pub fn create_channel() -> (CommandTx, CommandRx) {
 pub async fn run(mut rx: CommandRx, settings: Arc<RwLock<Settings>>, app_handle: tauri::AppHandle) {
     let mut paused = false;
     let mut rotation_state = RotationState::new();
+    let mut count_hint: Option<usize> = None;
+    // The file the last successful rotation put on the desktop
+    let mut current: Option<PathBuf> = None;
 
     loop {
         let interval = {
@@ -41,7 +46,7 @@ pub async fn run(mut rx: CommandRx, settings: Arc<RwLock<Settings>>, app_handle:
             cmd = rx.recv() => {
                 match cmd {
                     Some(Command::Next) => {
-                        do_rotate(&settings, &mut rotation_state, &app_handle).await;
+                        do_rotate(&settings, &mut rotation_state, &mut count_hint, &mut current, &app_handle).await;
                     }
                     Some(Command::Pause) => {
                         paused = true;
@@ -51,14 +56,15 @@ pub async fn run(mut rx: CommandRx, settings: Arc<RwLock<Settings>>, app_handle:
                     }
                     Some(Command::SettingsUpdated) => {
                         rotation_state.reset();
+                        count_hint = None;
                         // Immediately rotate with new settings
-                        do_rotate(&settings, &mut rotation_state, &app_handle).await;
+                        do_rotate(&settings, &mut rotation_state, &mut count_hint, &mut current, &app_handle).await;
                     }
                     Some(Command::Quit) | None => break,
                 }
             }
             _ = tokio::time::sleep(interval), if !paused => {
-                do_rotate(&settings, &mut rotation_state, &app_handle).await;
+                do_rotate(&settings, &mut rotation_state, &mut count_hint, &mut current, &app_handle).await;
             }
         }
     }
@@ -67,10 +73,21 @@ pub async fn run(mut rx: CommandRx, settings: Arc<RwLock<Settings>>, app_handle:
 async fn do_rotate(
     settings: &Arc<RwLock<Settings>>,
     rotation_state: &mut RotationState,
+    count_hint: &mut Option<usize>,
+    current: &mut Option<PathBuf>,
     app_handle: &tauri::AppHandle,
 ) {
-    match rotate(settings, rotation_state, app_handle).await {
-        Ok(()) => {
+    match rotate(
+        settings,
+        rotation_state,
+        count_hint,
+        current.as_deref(),
+        app_handle,
+    )
+    .await
+    {
+        Ok(path) => {
+            *current = Some(path);
             crate::update_tray_icon(app_handle, false, None);
         }
         Err(e) => {
@@ -126,92 +143,236 @@ fn set_wallpaper_span(path: &str) -> Result<(), AppError> {
             .output();
     }
 
-    wallpaper::set_mode(wallpaper::Mode::Span).map_err(|e| AppError::Wallpaper(e.to_string()))?;
+    set_mode_or_log(wallpaper::Mode::Span);
 
     Ok(())
+}
+
+/// Set the fit mode. The crate can't do this on macOS or on desktops it doesn't
+/// recognize, but by then the image itself is set, so that's not a failed rotation.
+fn set_mode_or_log(mode: wallpaper::Mode) {
+    if let Err(e) = wallpaper::set_mode(mode) {
+        eprintln!("[StashPaper] Couldn't set the fit mode: {}", e);
+    }
+}
+
+/// How many unusable images a rotation skips before giving up.
+const MAX_SKIPS: usize = 5;
+
+/// Delete files a failed rotation downloaded. They never reached the desktop, and
+/// nothing else would clean them up while rotations keep failing.
+fn discard(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn no_images() -> AppError {
+    AppError::Stash("no images match the query filter and minimum resolution".into())
+}
+
+fn no_usable_image(skipped: &[String]) -> AppError {
+    AppError::Stash(format!(
+        "no usable image in {} tries, last problem: {}. Check the query filter",
+        skipped.len(),
+        skipped.last().map(String::as_str).unwrap_or("none")
+    ))
+}
+
+/// Pick and download `wanted` images, skipping any a desktop can't show.
+/// `count_hint` carries the library size between rotations, so a rotation
+/// normally costs one GraphQL request per image instead of two. A page is tried
+/// at most once per batch, so a skip can't put one image on two monitors.
+async fn download_batch(
+    client: &reqwest::Client,
+    settings: &Settings,
+    rotation_state: &mut RotationState,
+    count_hint: &mut Option<usize>,
+    wanted: usize,
+    cache_dir: &Path,
+) -> Result<Vec<PathBuf>, AppError> {
+    let mut count = match *count_hint {
+        Some(count) => count,
+        None => stash::query_image_count(client, settings).await?,
+    };
+    let mut paths = Vec::new();
+    let mut skipped = Vec::new();
+    let mut tried = HashSet::new();
+
+    loop {
+        if count == 0 {
+            *count_hint = None;
+            return Err(no_images());
+        }
+        *count_hint = Some(count);
+        if paths.len() >= wanted.min(count) {
+            return Ok(paths);
+        }
+
+        let pick = rotation_state
+            .select_next(settings.rotation_mode, count)
+            .ok_or_else(no_images)?;
+        if !tried.insert(pick.page) {
+            if tried.len() < count {
+                // e.g. a new shuffle that starts with a page this batch already
+                // used; other pages are still untried
+                continue;
+            }
+            // Every page has had its turn in this batch
+            return if paths.is_empty() {
+                Err(no_usable_image(&skipped))
+            } else {
+                Ok(paths)
+            };
+        }
+        let (fresh_count, image) =
+            match stash::fetch_image_at_page(client, settings, pick.page, pick.random_seed).await {
+                Ok(result) => result,
+                Err(e) => {
+                    discard(&paths);
+                    return Err(e);
+                }
+            };
+        count = fresh_count;
+        *count_hint = Some(count);
+        if count == 0 {
+            *count_hint = None;
+            discard(&paths);
+            return Err(no_images());
+        }
+        let outcome = match image.and_then(|image| image.paths.image) {
+            Some(url) => match stash::download_image(client, &url, cache_dir, paths.len()).await {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    discard(&paths);
+                    return Err(e);
+                }
+            },
+            // The page is past the end of a library that shrank since the last
+            // count. Not the image's fault, so it doesn't use up a skip; the
+            // next pick uses the fresh count.
+            None if pick.page > count => continue,
+            None => stash::Download::Unusable("the image has no file".into()),
+        };
+
+        match outcome {
+            stash::Download::Saved(path) => paths.push(path),
+            stash::Download::Unusable(reason) => {
+                eprintln!("[StashPaper] Skipping image: {}", reason);
+                skipped.push(reason);
+                if skipped.len() >= MAX_SKIPS.min(count) {
+                    discard(&paths);
+                    return Err(no_usable_image(&skipped));
+                }
+            }
+        }
+    }
+}
+
+fn path_str(path: &Path) -> Result<&str, AppError> {
+    path.to_str()
+        .ok_or_else(|| AppError::Wallpaper("Invalid file path".into()))
+}
+
+/// Put `images` on the desktop through `set` (compositing them first for a
+/// multi-monitor layout), and only then delete older cache files. Deleting first
+/// would leave the desktop pointing at a missing file whenever a rotation fails.
+/// `set` gets the file and whether it's a spanned composite. `current` is the
+/// file the last successful rotation set, if known.
+fn apply_wallpaper(
+    images: &[PathBuf],
+    monitors: Option<&[crate::compositor::MonitorGeometry]>,
+    cache_dir: &Path,
+    current: Option<&Path>,
+    set: impl FnOnce(&str, bool) -> Result<(), AppError>,
+) -> Result<PathBuf, AppError> {
+    let wallpaper_path = match monitors {
+        Some(_) => cache_dir.join(format!(
+            "wallpaper_composite_{}.jpg",
+            stash::timestamp_millis()
+        )),
+        None => images[0].clone(),
+    };
+    if let Some(geoms) = monitors {
+        if let Err(e) = crate::compositor::composite_wallpaper(images, geoms, &wallpaper_path) {
+            // Nothing reached the desktop
+            discard(images);
+            discard(&[wallpaper_path]);
+            return Err(e);
+        }
+    }
+    match set(path_str(&wallpaper_path)?, monitors.is_some()) {
+        Ok(()) => {
+            stash::clean_wallpaper_cache(cache_dir, &[&wallpaper_path]);
+            Ok(wallpaper_path)
+        }
+        Err(e) => {
+            // A setter can fail after applying the file to some monitors or
+            // workspaces, so keep it along with the last good one. Everything
+            // else goes, so repeated failures can't fill the cache. With no
+            // known good file (first rotation since start), delete nothing
+            // older: the desktop may still point at one of them.
+            match current {
+                Some(current) => {
+                    stash::clean_wallpaper_cache(cache_dir, &[&wallpaper_path, current])
+                }
+                None => discard(
+                    &images
+                        .iter()
+                        .filter(|p| **p != wallpaper_path)
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                ),
+            }
+            Err(e)
+        }
+    }
 }
 
 async fn rotate(
     settings: &Arc<RwLock<Settings>>,
     rotation_state: &mut RotationState,
+    count_hint: &mut Option<usize>,
+    current: Option<&Path>,
     app_handle: &tauri::AppHandle,
-) -> Result<(), AppError> {
+) -> Result<PathBuf, AppError> {
     let s = settings.read().await.clone();
-
-    let count = stash::query_image_count(&s).await?;
-    if count == 0 {
-        return Err(AppError::Stash("No images found".into()));
-    }
+    let client = stash::client_for(&s)?;
 
     let cache_dir = app_handle
         .path()
         .app_cache_dir()
         .map_err(|e: tauri::Error| AppError::Settings(e.to_string()))?;
 
-    // Clean up old cached wallpapers before downloading new ones
-    stash::clean_wallpaper_cache(&cache_dir);
-
-    // Determine how many images we need
     let monitors = get_monitor_geometries(app_handle);
-    let num_images = if s.per_monitor && monitors.len() > 1 {
-        monitors.len()
-    } else {
-        1
-    };
+    let per_monitor = s.per_monitor && monitors.len() > 1;
+    let wanted = if per_monitor { monitors.len() } else { 1 };
 
-    // Fetch N images
-    let results = rotation_state.select_next_batch(s.rotation_mode, count, num_images);
-    if results.is_empty() {
-        return Err(AppError::Stash("No images found".into()));
-    }
+    let images =
+        download_batch(&client, &s, rotation_state, count_hint, wanted, &cache_dir).await?;
 
-    let mut downloaded_paths = Vec::new();
-    for result in &results {
-        let image = stash::fetch_image_at_page(&s, result.page, result.random_seed)
-            .await?
-            .ok_or_else(|| AppError::Stash("Image not found at page".into()))?;
-
-        let image_url = image
-            .paths
-            .image
-            .ok_or_else(|| AppError::Stash("Image has no download URL".into()))?;
-
-        let file_path = stash::download_image(&s, &image_url, &cache_dir).await?;
-        downloaded_paths.push(file_path);
-    }
-
-    if s.per_monitor && monitors.len() > 1 {
-        // Composite and set as spanned wallpaper
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let composite_path = cache_dir.join(format!("wallpaper_composite_{}.png", timestamp));
-        let geoms: Vec<crate::compositor::MonitorGeometry> = monitors
-            .iter()
-            .map(|m| crate::compositor::MonitorGeometry {
-                x: m.x,
-                y: m.y,
-                width: m.width,
-                height: m.height,
-            })
-            .collect();
-        crate::compositor::composite_wallpaper(&downloaded_paths, &geoms, &composite_path)?;
-
-        let path_str = composite_path
-            .to_str()
-            .ok_or_else(|| AppError::Wallpaper("Invalid file path".into()))?;
-
-        set_wallpaper_span(path_str)?;
-    } else {
-        // Single monitor path (unchanged behavior)
-        let path_str = downloaded_paths[0]
-            .to_str()
-            .ok_or_else(|| AppError::Wallpaper("Invalid file path".into()))?;
-        set_wallpaper(path_str, &s)?;
-    }
-
-    Ok(())
+    let geoms: Vec<crate::compositor::MonitorGeometry> = monitors
+        .iter()
+        .map(|m| crate::compositor::MonitorGeometry {
+            x: m.x,
+            y: m.y,
+            width: m.width,
+            height: m.height,
+        })
+        .collect();
+    apply_wallpaper(
+        &images,
+        per_monitor.then_some(geoms.as_slice()),
+        &cache_dir,
+        current,
+        |path, spanned| {
+            if spanned {
+                set_wallpaper_span(path)
+            } else {
+                set_wallpaper(path, &s)
+            }
+        },
+    )
 }
 
 fn set_wallpaper(path: &str, settings: &Settings) -> Result<(), AppError> {
@@ -259,7 +420,382 @@ fn set_wallpaper(path: &str, settings: &Settings) -> Result<(), AppError> {
         crate::settings::FitMode::Stretch => wallpaper::Mode::Stretch,
         crate::settings::FitMode::Tile => wallpaper::Mode::Tile,
     };
-    wallpaper::set_mode(mode).map_err(|e| AppError::Wallpaper(e.to_string()))?;
+    set_mode_or_log(mode);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use wiremock::matchers::{body_partial_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn png_bytes() -> Vec<u8> {
+        let img = image::RgbImage::from_pixel(2, 2, image::Rgb([10, 20, 30]));
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+
+    /// A findImages response whose one image is served from `at` on `server`.
+    fn page(server: &MockServer, count: usize, at: &str) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"findImages": {"count": count, "images": [
+                {"id": "1", "paths": {"image": format!("{}{}", server.uri(), at)}}
+            ]}}
+        }))
+    }
+
+    /// Matches the count query (per_page 0)
+    fn count_query() -> impl wiremock::Match {
+        body_partial_json(json!({"variables": {"filter": {"per_page": 0}}}))
+    }
+
+    /// Matches the request for one page
+    fn page_query(n: usize) -> impl wiremock::Match {
+        body_partial_json(json!({"variables": {"filter": {"per_page": 1, "page": n}}}))
+    }
+
+    async fn stash_with_files() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/good"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(png_bytes(), "image/png"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/clip"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(b"....ftypmp42".to_vec(), "video/mp4"),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn settings_for(server: &MockServer) -> Settings {
+        Settings {
+            stash_url: server.uri(),
+            api_key: "key".into(),
+            rotation_mode: crate::settings::RotationMode::Sequential,
+            ..Settings::default()
+        }
+    }
+
+    async fn serve_pages(server: &MockServer, count: usize, files: &[&str]) {
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(count_query())
+            .respond_with(page(server, count, files[0]))
+            .mount(server)
+            .await;
+        for (i, at) in files.iter().enumerate() {
+            Mock::given(method("POST"))
+                .and(path("/graphql"))
+                .and(page_query(i + 1))
+                .respond_with(page(server, count, at))
+                .expect(1)
+                .mount(server)
+                .await;
+        }
+    }
+
+    async fn run_batch(
+        server: &MockServer,
+        count_hint: &mut Option<usize>,
+        wanted: usize,
+    ) -> (Result<Vec<PathBuf>, AppError>, tempfile::TempDir) {
+        let settings = settings_for(server);
+        let client = stash::client_for(&settings).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let result = download_batch(
+            &client,
+            &settings,
+            &mut RotationState::new(),
+            count_hint,
+            wanted,
+            dir.path(),
+        )
+        .await;
+        (result, dir)
+    }
+
+    #[tokio::test]
+    async fn skips_an_unusable_image_and_moves_to_the_next_page() {
+        let server = stash_with_files().await;
+        // page 1 is a video clip, page 2 a real image
+        serve_pages(&server, 3, &["/clip", "/good"]).await;
+
+        let mut count_hint = None;
+        let (result, _dir) = run_batch(&server, &mut count_hint, 1).await;
+        let paths = result.unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), png_bytes());
+        assert_eq!(count_hint, Some(3));
+    }
+
+    #[tokio::test]
+    async fn gives_up_after_trying_every_image() {
+        let server = stash_with_files().await;
+        serve_pages(&server, 2, &["/clip", "/clip"]).await;
+
+        let (result, _dir) = run_batch(&server, &mut None, 1).await;
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("no usable image in 2 tries"), "{err}");
+        assert!(err.contains("video/mp4, not an image"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn gives_up_after_five_skips_in_a_big_library() {
+        let server = stash_with_files().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(page(&server, 50, "/clip"))
+            // the count query plus five pages, and no more
+            .expect(6)
+            .mount(&server)
+            .await;
+
+        let (result, _dir) = run_batch(&server, &mut None, 1).await;
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("no usable image in 5 tries"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_known_count_costs_one_request_per_image() {
+        let server = stash_with_files().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(count_query())
+            .respond_with(page(&server, 10, "/good"))
+            .expect(0)
+            .mount(&server)
+            .await;
+        for n in [1, 2] {
+            Mock::given(method("POST"))
+                .and(path("/graphql"))
+                .and(page_query(n))
+                .respond_with(page(&server, 10, "/good"))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let (result, _dir) = run_batch(&server, &mut Some(10), 2).await;
+        let names: Vec<String> = result
+            .unwrap()
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names[0].contains("_0."), "{names:?}");
+        assert!(names[1].contains("_1."), "{names:?}");
+    }
+
+    #[tokio::test]
+    async fn a_skip_does_not_put_one_image_on_two_monitors() {
+        let server = stash_with_files().await;
+        // three monitors, three images, one of them unusable: sequential
+        // would wrap back to page 1, which this batch already used
+        serve_pages(&server, 3, &["/good", "/good", "/clip"]).await;
+
+        let (result, _dir) = run_batch(&server, &mut None, 3).await;
+        // two distinct images; the compositor reuses the last for monitor 3
+        assert_eq!(result.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_library_that_shrank_is_noticed_in_the_same_rotation() {
+        let server = stash_with_files().await;
+        let empty = ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"findImages": {"count": 1, "images": []}}
+        }));
+        // the hint says 10, but the filter now matches 1 image
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(page_query(4))
+            .respond_with(empty)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(page_query(1))
+            .respond_with(page(&server, 1, "/good"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let settings = settings_for(&server);
+        let client = stash::client_for(&settings).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut rotation = RotationState::new();
+        for _ in 0..3 {
+            rotation.select_next(settings.rotation_mode, 10);
+        }
+        let mut count_hint = Some(10);
+        let paths = download_batch(
+            &client,
+            &settings,
+            &mut rotation,
+            &mut count_hint,
+            1,
+            dir.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(count_hint, Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_failed_batch_leaves_no_files_behind() {
+        let server = stash_with_files().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(page_query(1))
+            .respond_with(page(&server, 50, "/good"))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(page(&server, 50, "/clip"))
+            .mount(&server)
+            .await;
+
+        // page 1 downloads, then five clips end the batch
+        let (result, dir) = run_batch(&server, &mut Some(50), 2).await;
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_empty_library_is_an_error_and_forgets_the_count() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {"findImages": {"count": 0, "images": []}}
+            })))
+            .mount(&server)
+            .await;
+
+        let mut count_hint = Some(5);
+        let (result, _dir) = run_batch(&server, &mut count_hint, 1).await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("no images match the query filter"));
+        assert_eq!(count_hint, None);
+    }
+
+    fn cache_with_old_wallpaper() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("wallpaper_1_0.png");
+        let new = dir.path().join("wallpaper_2_0.png");
+        std::fs::write(&old, png_bytes()).unwrap();
+        std::fs::write(&new, png_bytes()).unwrap();
+        (dir, old, new)
+    }
+
+    #[test]
+    fn a_failed_set_keeps_the_current_wallpaper_file() {
+        let (dir, old, new) = cache_with_old_wallpaper();
+        let result = apply_wallpaper(
+            std::slice::from_ref(&new),
+            None,
+            dir.path(),
+            None,
+            |_, _| Err(AppError::Wallpaper("desktop said no".into())),
+        );
+        assert!(result.is_err());
+        // with no known good file, nothing older may go: the desktop could be on it
+        assert!(old.exists(), "the file on the desktop must survive");
+        // a setter can fail after applying the file to some monitors
+        assert!(new.exists());
+    }
+
+    #[test]
+    fn repeated_failed_sets_keep_the_cache_bounded() {
+        let (dir, current, new) = cache_with_old_wallpaper();
+        let stale = dir.path().join("wallpaper_0_0.png");
+        std::fs::write(&stale, png_bytes()).unwrap();
+        let result = apply_wallpaper(
+            std::slice::from_ref(&new),
+            None,
+            dir.path(),
+            Some(&current),
+            |_, _| Err(AppError::Wallpaper("desktop said no".into())),
+        );
+        assert!(result.is_err());
+        assert!(current.exists(), "the last good file stays");
+        assert!(
+            new.exists(),
+            "the file the setter may have partly applied stays"
+        );
+        assert!(!stale.exists(), "anything else goes");
+    }
+
+    #[test]
+    fn a_successful_set_cleans_up_everything_else() {
+        let (dir, old, new) = cache_with_old_wallpaper();
+        let mut set_to = None;
+        let path = apply_wallpaper(
+            std::slice::from_ref(&new),
+            None,
+            dir.path(),
+            None,
+            |p, spanned| {
+                set_to = Some((p.to_string(), spanned));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(path, new);
+        assert_eq!(set_to, Some((new.to_str().unwrap().to_string(), false)));
+        assert!(!old.exists());
+        assert!(new.exists());
+    }
+
+    #[test]
+    fn per_monitor_sets_the_composite_and_keeps_only_it() {
+        let (dir, old, new) = cache_with_old_wallpaper();
+        let monitors = [
+            crate::compositor::MonitorGeometry {
+                x: 0,
+                y: 0,
+                width: 4,
+                height: 4,
+            },
+            crate::compositor::MonitorGeometry {
+                x: 4,
+                y: 0,
+                width: 4,
+                height: 4,
+            },
+        ];
+        let path = apply_wallpaper(
+            &[old.clone(), new.clone()],
+            Some(&monitors),
+            dir.path(),
+            None,
+            |_, spanned| {
+                assert!(spanned);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("wallpaper_composite_"));
+        let left: Vec<PathBuf> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(left, vec![path]);
+    }
 }
