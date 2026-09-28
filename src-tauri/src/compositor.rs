@@ -1,5 +1,6 @@
 use crate::error::AppError;
-use image::{DynamicImage, GenericImageView, RgbaImage};
+use image::codecs::jpeg::JpegEncoder;
+use image::{DynamicImage, GenericImageView, RgbImage};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -14,7 +15,7 @@ pub struct MonitorGeometry {
 ///
 /// The image is scaled so that the smaller dimension matches the target, then the
 /// overflowing dimension is center-cropped.
-fn crop_to_fill(img: &DynamicImage, target_w: u32, target_h: u32) -> RgbaImage {
+fn crop_to_fill(img: &DynamicImage, target_w: u32, target_h: u32) -> RgbImage {
     let (src_w, src_h) = img.dimensions();
 
     // Calculate scale factor: we need to cover the entire target area,
@@ -35,14 +36,15 @@ fn crop_to_fill(img: &DynamicImage, target_w: u32, target_h: u32) -> RgbaImage {
 
     resized
         .crop_imm(crop_x, crop_y, target_w, target_h)
-        .to_rgba8()
+        .to_rgb8()
 }
 
 /// Composite multiple images onto a single canvas matching the bounding box of all monitors.
 ///
 /// Each image is resized to fill its corresponding monitor's area using `crop_to_fill`.
 /// `image_paths[i]` maps to `monitors[i]`. If there are fewer images than monitors,
-/// the last image is reused for remaining monitors. The result is saved as PNG.
+/// the last image is reused for remaining monitors. The result is saved as a JPEG:
+/// a spanned canvas is tens of megabytes as PNG and slow to encode.
 pub fn composite_wallpaper(
     image_paths: &[PathBuf],
     monitors: &[MonitorGeometry],
@@ -69,7 +71,7 @@ pub fn composite_wallpaper(
     let canvas_w = (max_x - min_x) as u32;
     let canvas_h = (max_y - min_y) as u32;
 
-    let mut canvas = RgbaImage::new(canvas_w, canvas_h);
+    let mut canvas = RgbImage::new(canvas_w, canvas_h);
 
     // Load images
     let images: Vec<DynamicImage> = image_paths
@@ -94,8 +96,12 @@ pub fn composite_wallpaper(
         image::imageops::overlay(&mut canvas, &filled, canvas_x as i64, canvas_y as i64);
     }
 
+    let file = std::fs::File::create(output_path)?;
     canvas
-        .save(output_path)
+        .write_with_encoder(JpegEncoder::new_with_quality(
+            std::io::BufWriter::new(file),
+            90,
+        ))
         .map_err(|e| AppError::Wallpaper(format!("Failed to save composite: {}", e)))?;
 
     Ok(())
@@ -104,7 +110,20 @@ pub fn composite_wallpaper(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::RgbaImage;
     use std::env;
+
+    /// JPEG is lossy, so compare channels with a small tolerance.
+    fn assert_rgb_near(pixel: &image::Rgba<u8>, expected: [u8; 3], what: &str) {
+        for (channel, want) in pixel.0.iter().zip(expected) {
+            assert!(
+                channel.abs_diff(want) <= 8,
+                "{what}: got {:?}, want {:?}",
+                pixel.0,
+                expected
+            );
+        }
+    }
 
     /// Create a solid-color test PNG in the temp directory and return its path.
     fn make_test_image(width: u32, height: u32, r: u8, g: u8, b: u8) -> PathBuf {
@@ -131,7 +150,7 @@ mod tests {
     fn test_single_monitor_resizes_to_fit() {
         let img_path = make_test_image(800, 600, 255, 0, 0);
         let output = env::temp_dir().join(format!(
-            "stashpaper_test_single_{}.png",
+            "stashpaper_test_single_{}.jpg",
             rand::random::<u32>()
         ));
 
@@ -159,7 +178,7 @@ mod tests {
         let red_img = make_test_image(1920, 1080, 255, 0, 0);
         let blue_img = make_test_image(1920, 1080, 0, 0, 255);
         let output = env::temp_dir().join(format!(
-            "stashpaper_test_dual_{}.png",
+            "stashpaper_test_dual_{}.jpg",
             rand::random::<u32>()
         ));
 
@@ -186,16 +205,10 @@ mod tests {
         assert_eq!(h, 1080, "Canvas height should be 1080");
 
         // Check left side is red (sample pixel at 100, 100)
-        let left_pixel = result.get_pixel(100, 100);
-        assert_eq!(left_pixel[0], 255, "Left monitor R channel should be 255");
-        assert_eq!(left_pixel[1], 0, "Left monitor G channel should be 0");
-        assert_eq!(left_pixel[2], 0, "Left monitor B channel should be 0");
+        assert_rgb_near(result.get_pixel(100, 100), [255, 0, 0], "left monitor");
 
         // Check right side is blue (sample pixel at 2000, 100)
-        let right_pixel = result.get_pixel(2000, 100);
-        assert_eq!(right_pixel[0], 0, "Right monitor R channel should be 0");
-        assert_eq!(right_pixel[1], 0, "Right monitor G channel should be 0");
-        assert_eq!(right_pixel[2], 255, "Right monitor B channel should be 255");
+        assert_rgb_near(result.get_pixel(2000, 100), [0, 0, 255], "right monitor");
 
         // Clean up
         let _ = std::fs::remove_file(&red_img);
@@ -208,7 +221,7 @@ mod tests {
         let red_img = make_test_image(1920, 1080, 255, 0, 0);
         let green_img = make_test_image(2560, 1440, 0, 255, 0);
         let output = env::temp_dir().join(format!(
-            "stashpaper_test_offset_{}.png",
+            "stashpaper_test_offset_{}.jpg",
             rand::random::<u32>()
         ));
 

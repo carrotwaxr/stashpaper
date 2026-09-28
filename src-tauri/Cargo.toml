@@ -27,4 +27,8 @@ tokio = { version = "1", features = ["full"] }
 wallpaper = "3.2"
 rand = "0.9"
 thiserror = "2"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = "0.6"
