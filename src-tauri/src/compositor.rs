@@ -33,7 +33,9 @@ fn crop_to_fill(img: &DynamicImage, target_w: u32, target_h: u32) -> RgbaImage {
     let crop_x = (scaled_w.saturating_sub(target_w)) / 2;
     let crop_y = (scaled_h.saturating_sub(target_h)) / 2;
 
-    resized.crop_imm(crop_x, crop_y, target_w, target_h).to_rgba8()
+    resized
+        .crop_imm(crop_x, crop_y, target_w, target_h)
+        .to_rgba8()
 }
 
 /// Composite multiple images onto a single canvas matching the bounding box of all monitors.
@@ -57,11 +59,7 @@ pub fn composite_wallpaper(
     // Monitors can have negative offsets, so we need to find the true min/max.
     let min_x = monitors.iter().map(|m| m.x).min().unwrap();
     let min_y = monitors.iter().map(|m| m.y).min().unwrap();
-    let max_x = monitors
-        .iter()
-        .map(|m| m.x + m.width as i32)
-        .max()
-        .unwrap();
+    let max_x = monitors.iter().map(|m| m.x + m.width as i32).max().unwrap();
     let max_y = monitors
         .iter()
         .map(|m| m.y + m.height as i32)
@@ -77,7 +75,8 @@ pub fn composite_wallpaper(
     let images: Vec<DynamicImage> = image_paths
         .iter()
         .map(|p| {
-            image::open(p).map_err(|e| AppError::Wallpaper(format!("Failed to open {}: {}", p.display(), e)))
+            image::open(p)
+                .map_err(|e| AppError::Wallpaper(format!("Failed to open {}: {}", p.display(), e)))
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -92,12 +91,7 @@ pub fn composite_wallpaper(
         let canvas_y = (monitor.y - min_y) as u32;
 
         // Copy the filled image onto the canvas
-        image::imageops::overlay(
-            &mut canvas,
-            &filled,
-            canvas_x as i64,
-            canvas_y as i64,
-        );
+        image::imageops::overlay(&mut canvas, &filled, canvas_x as i64, canvas_y as i64);
     }
 
     canvas
@@ -117,12 +111,18 @@ mod tests {
         let dir = env::temp_dir().join("stashpaper_test");
         std::fs::create_dir_all(&dir).unwrap();
 
-        let filename = format!("test_{}x{}_{}_{}_{}_{}.png", width, height, r, g, b, rand::random::<u32>());
+        let filename = format!(
+            "test_{}x{}_{}_{}_{}_{}.png",
+            width,
+            height,
+            r,
+            g,
+            b,
+            rand::random::<u32>()
+        );
         let path = dir.join(filename);
 
-        let img = RgbaImage::from_fn(width, height, |_x, _y| {
-            image::Rgba([r, g, b, 255])
-        });
+        let img = RgbaImage::from_fn(width, height, |_x, _y| image::Rgba([r, g, b, 255]));
         img.save(&path).unwrap();
         path
     }
@@ -130,7 +130,10 @@ mod tests {
     #[test]
     fn test_single_monitor_resizes_to_fit() {
         let img_path = make_test_image(800, 600, 255, 0, 0);
-        let output = env::temp_dir().join(format!("stashpaper_test_single_{}.png", rand::random::<u32>()));
+        let output = env::temp_dir().join(format!(
+            "stashpaper_test_single_{}.png",
+            rand::random::<u32>()
+        ));
 
         let monitors = vec![MonitorGeometry {
             x: 0,
@@ -139,7 +142,7 @@ mod tests {
             height: 1080,
         }];
 
-        composite_wallpaper(&[img_path.clone()], &monitors, &output).unwrap();
+        composite_wallpaper(std::slice::from_ref(&img_path), &monitors, &output).unwrap();
 
         let result = image::open(&output).unwrap();
         let (w, h) = result.dimensions();
@@ -155,7 +158,10 @@ mod tests {
     fn test_two_monitors_side_by_side() {
         let red_img = make_test_image(1920, 1080, 255, 0, 0);
         let blue_img = make_test_image(1920, 1080, 0, 0, 255);
-        let output = env::temp_dir().join(format!("stashpaper_test_dual_{}.png", rand::random::<u32>()));
+        let output = env::temp_dir().join(format!(
+            "stashpaper_test_dual_{}.png",
+            rand::random::<u32>()
+        ));
 
         let monitors = vec![
             MonitorGeometry {
@@ -201,7 +207,10 @@ mod tests {
     fn test_monitors_with_offset() {
         let red_img = make_test_image(1920, 1080, 255, 0, 0);
         let green_img = make_test_image(2560, 1440, 0, 255, 0);
-        let output = env::temp_dir().join(format!("stashpaper_test_offset_{}.png", rand::random::<u32>()));
+        let output = env::temp_dir().join(format!(
+            "stashpaper_test_offset_{}.png",
+            rand::random::<u32>()
+        ));
 
         let monitors = vec![
             MonitorGeometry {
@@ -240,7 +249,7 @@ mod tests {
         let img_path = make_test_image(100, 100, 128, 128, 128);
         let output = env::temp_dir().join("stashpaper_test_empty_monitors.png");
 
-        let result = composite_wallpaper(&[img_path.clone()], &[], &output);
+        let result = composite_wallpaper(std::slice::from_ref(&img_path), &[], &output);
         assert!(result.is_err());
 
         let err_msg = result.unwrap_err().to_string();

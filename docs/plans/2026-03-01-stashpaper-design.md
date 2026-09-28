@@ -1,7 +1,7 @@
 # StashPaper — Design Document
 
 **Date:** 2026-03-01
-**Status:** Approved
+**Status:** Superseded. Kept for history; the code and README describe the app as it is. Two parts never shipped as written here: settings are a plain JSON file (no `tauri-plugin-store`), and per-monitor wallpapers come from compositing images into one spanned wallpaper, not from the `wallpaper` crate.
 
 ## Overview
 

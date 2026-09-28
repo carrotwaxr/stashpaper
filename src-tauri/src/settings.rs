@@ -125,7 +125,10 @@ pub fn load(app: &tauri::AppHandle) -> Result<Settings, AppError> {
     match serde_json::from_str(&contents) {
         Ok(settings) => Ok(settings),
         Err(e) => {
-            eprintln!("[StashPaper] Failed to parse settings, using defaults: {}", e);
+            eprintln!(
+                "[StashPaper] Failed to parse settings, using defaults: {}",
+                e
+            );
             Ok(Settings::default())
         }
     }
@@ -160,7 +163,9 @@ mod tests {
         let settings = Settings {
             stash_url: "http://localhost:9999".into(),
             api_key: "test-key".into(),
-            query_filter: r#"{"image_filter":{"tags":{"value":["wallpaper"],"modifier":"INCLUDES_ALL"}}}"#.into(),
+            query_filter:
+                r#"{"image_filter":{"tags":{"value":["wallpaper"],"modifier":"INCLUDES_ALL"}}}"#
+                    .into(),
             rotation_mode: RotationMode::Shuffle,
             interval: Interval::OneHour,
             fit_mode: FitMode::Crop,
@@ -190,7 +195,10 @@ mod tests {
 
     #[test]
     fn test_interval_durations() {
-        assert_eq!(Interval::FiveMinutes.to_duration(), Duration::from_secs(300));
+        assert_eq!(
+            Interval::FiveMinutes.to_duration(),
+            Duration::from_secs(300)
+        );
         assert_eq!(Interval::Daily.to_duration(), Duration::from_secs(86400));
     }
 

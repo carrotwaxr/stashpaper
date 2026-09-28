@@ -22,11 +22,7 @@ pub fn create_channel() -> (CommandTx, CommandRx) {
     mpsc::channel(32)
 }
 
-pub async fn run(
-    mut rx: CommandRx,
-    settings: Arc<RwLock<Settings>>,
-    app_handle: tauri::AppHandle,
-) {
+pub async fn run(mut rx: CommandRx, settings: Arc<RwLock<Settings>>, app_handle: tauri::AppHandle) {
     let mut paused = false;
     let mut rotation_state = RotationState::new();
 
@@ -107,22 +103,30 @@ fn get_monitor_geometries(app: &tauri::AppHandle) -> Vec<crate::MonitorInfo> {
 
 /// Set wallpaper with Span mode (for composited multi-monitor images).
 fn set_wallpaper_span(path: &str) -> Result<(), AppError> {
-    wallpaper::set_from_path(path)
-        .map_err(|e| AppError::Wallpaper(e.to_string()))?;
+    wallpaper::set_from_path(path).map_err(|e| AppError::Wallpaper(e.to_string()))?;
 
     #[cfg(target_os = "linux")]
     {
         let uri = format!("file://{}", path);
         let _ = std::process::Command::new("gsettings")
-            .args(["set", "org.gnome.desktop.background", "picture-uri-dark", &uri])
+            .args([
+                "set",
+                "org.gnome.desktop.background",
+                "picture-uri-dark",
+                &uri,
+            ])
             .output();
         let _ = std::process::Command::new("gsettings")
-            .args(["set", "org.gnome.desktop.background", "picture-options", "spanned"])
+            .args([
+                "set",
+                "org.gnome.desktop.background",
+                "picture-options",
+                "spanned",
+            ])
             .output();
     }
 
-    wallpaper::set_mode(wallpaper::Mode::Span)
-        .map_err(|e| AppError::Wallpaper(e.to_string()))?;
+    wallpaper::set_mode(wallpaper::Mode::Span).map_err(|e| AppError::Wallpaper(e.to_string()))?;
 
     Ok(())
 }
@@ -212,8 +216,7 @@ async fn rotate(
 
 fn set_wallpaper(path: &str, settings: &Settings) -> Result<(), AppError> {
     // Set wallpaper via the wallpaper crate (handles most DEs)
-    wallpaper::set_from_path(path)
-        .map_err(|e| AppError::Wallpaper(e.to_string()))?;
+    wallpaper::set_from_path(path).map_err(|e| AppError::Wallpaper(e.to_string()))?;
 
     // GNOME fixes: set picture-uri-dark for dark mode, and picture-options
     // to match fit_mode (important if switching back from per-monitor/spanned)
@@ -221,7 +224,12 @@ fn set_wallpaper(path: &str, settings: &Settings) -> Result<(), AppError> {
     {
         let uri = format!("file://{}", path);
         let _ = std::process::Command::new("gsettings")
-            .args(["set", "org.gnome.desktop.background", "picture-uri-dark", &uri])
+            .args([
+                "set",
+                "org.gnome.desktop.background",
+                "picture-uri-dark",
+                &uri,
+            ])
             .output();
 
         let gnome_option = match settings.fit_mode {
@@ -233,7 +241,12 @@ fn set_wallpaper(path: &str, settings: &Settings) -> Result<(), AppError> {
             crate::settings::FitMode::Tile => "wallpaper",
         };
         let _ = std::process::Command::new("gsettings")
-            .args(["set", "org.gnome.desktop.background", "picture-options", gnome_option])
+            .args([
+                "set",
+                "org.gnome.desktop.background",
+                "picture-options",
+                gnome_option,
+            ])
             .output();
     }
 
@@ -246,8 +259,7 @@ fn set_wallpaper(path: &str, settings: &Settings) -> Result<(), AppError> {
         crate::settings::FitMode::Stretch => wallpaper::Mode::Stretch,
         crate::settings::FitMode::Tile => wallpaper::Mode::Tile,
     };
-    wallpaper::set_mode(mode)
-        .map_err(|e| AppError::Wallpaper(e.to_string()))?;
+    wallpaper::set_mode(mode).map_err(|e| AppError::Wallpaper(e.to_string()))?;
 
     Ok(())
 }

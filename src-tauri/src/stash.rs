@@ -176,8 +176,10 @@ pub async fn query_image_count(settings: &Settings) -> Result<usize, AppError> {
         .await
         .map_err(|e| AppError::Stash(e.to_string()))?;
 
-    let gql: GraphQLResponse<FindImagesData> =
-        resp.json().await.map_err(|e| AppError::Stash(e.to_string()))?;
+    let gql: GraphQLResponse<FindImagesData> = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Stash(e.to_string()))?;
 
     if let Some(errors) = gql.errors {
         if let Some(err) = errors.first() {
@@ -185,10 +187,7 @@ pub async fn query_image_count(settings: &Settings) -> Result<usize, AppError> {
         }
     }
 
-    Ok(gql
-        .data
-        .map(|d| d.find_images.count)
-        .unwrap_or(0))
+    Ok(gql.data.map(|d| d.find_images.count).unwrap_or(0))
 }
 
 pub async fn fetch_image_at_page(
@@ -213,8 +212,10 @@ pub async fn fetch_image_at_page(
         .await
         .map_err(|e| AppError::Stash(e.to_string()))?;
 
-    let gql: GraphQLResponse<FindImagesData> =
-        resp.json().await.map_err(|e| AppError::Stash(e.to_string()))?;
+    let gql: GraphQLResponse<FindImagesData> = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Stash(e.to_string()))?;
 
     if let Some(errors) = gql.errors {
         if let Some(err) = errors.first() {
@@ -247,8 +248,10 @@ pub async fn test_query(settings: &Settings) -> Result<usize, AppError> {
         .await
         .map_err(|e| AppError::Stash(e.to_string()))?;
 
-    let gql: GraphQLResponse<FindImagesData> =
-        resp.json().await.map_err(|e| AppError::Stash(e.to_string()))?;
+    let gql: GraphQLResponse<FindImagesData> = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Stash(e.to_string()))?;
 
     if let Some(errors) = gql.errors {
         if let Some(err) = errors.first() {
@@ -256,10 +259,7 @@ pub async fn test_query(settings: &Settings) -> Result<usize, AppError> {
         }
     }
 
-    Ok(gql
-        .data
-        .map(|d| d.find_images.count)
-        .unwrap_or(0))
+    Ok(gql.data.map(|d| d.find_images.count).unwrap_or(0))
 }
 
 /// Remove old wallpaper files from cache directory.
@@ -398,7 +398,8 @@ mod tests {
                     "orientation": { "value": "LANDSCAPE" },
                     "rating100": { "value": 90, "modifier": "GREATER_THAN" }
                 }
-            }"#.into(),
+            }"#
+            .into(),
             ..Settings::default()
         };
         let vars = build_variables(&settings, 1, 3, None);
@@ -437,7 +438,10 @@ mod tests {
         };
         let vars = build_variables(&settings, 1, 1, None);
         assert_eq!(vars["image_filter"]["resolution"]["value"], "STANDARD_HD");
-        assert_eq!(vars["image_filter"]["resolution"]["modifier"], "GREATER_THAN");
+        assert_eq!(
+            vars["image_filter"]["resolution"]["modifier"],
+            "GREATER_THAN"
+        );
     }
 
     #[test]
@@ -445,7 +449,9 @@ mod tests {
         let settings = Settings {
             stash_url: "http://localhost:9999".into(),
             api_key: "key".into(),
-            query_filter: r#"{"image_filter": {"resolution": {"value": "FOUR_K", "modifier": "EQUALS"}}}"#.into(),
+            query_filter:
+                r#"{"image_filter": {"resolution": {"value": "FOUR_K", "modifier": "EQUALS"}}}"#
+                    .into(),
             min_resolution: MinResolution::Hd720,
             ..Settings::default()
         };
