@@ -20,6 +20,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The .deb and AppImage need a glibc at least as new as the build
+          # runner's, so build Linux on the oldest supported runner.
           - platform: ubuntu-22.04
             args: ''
           - platform: windows-latest
@@ -45,10 +47,11 @@ jobs:
           node-version: lts/*
           cache: npm
 
-      - name: Install Rust stable
+      # Keep in step with ci.yml
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
-          toolchain: stable
+          toolchain: 1.98.1
           targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: Rust cache

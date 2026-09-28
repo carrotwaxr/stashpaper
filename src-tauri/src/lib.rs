@@ -40,7 +40,7 @@ struct TrayIcons {
 /// Apply a grayscale + red tint to RGBA icon data to produce an "error" variant.
 fn make_error_icon(rgba: &[u8], width: u32, height: u32) -> Image<'static> {
     let mut tinted = rgba.to_vec();
-    for pixel in tinted.chunks_exact_mut(4) {
+    for pixel in tinted.as_chunks_mut::<4>().0 {
         let r = pixel[0] as f32;
         let g = pixel[1] as f32;
         let b = pixel[2] as f32;

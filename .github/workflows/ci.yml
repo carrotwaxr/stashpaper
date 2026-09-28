@@ -33,10 +33,12 @@ jobs:
           node-version: lts/*
           cache: npm
 
-      - name: Install Rust stable
+      # Pinned so a new stable release can't add lints that turn CI red, and
+      # so the release build matches what CI tested. Bump it on purpose.
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
-          toolchain: stable
+          toolchain: 1.98.1
           components: clippy, rustfmt
 
       - name: Rust cache
@@ -44,18 +46,12 @@ jobs:
         with:
           workspaces: './src-tauri -> target'
 
-      - name: Versions match
-        if: runner.os == 'Linux'
-        run: |
-          npm_version=$(node -p "require('./package.json').version")
-          cargo_version=$(sed -n 's/^version = "\(.*\)"$/\1/p' src-tauri/Cargo.toml | head -1)
-          if [ "$npm_version" != "$cargo_version" ]; then
-            echo "package.json is $npm_version but Cargo.toml is $cargo_version"
-            exit 1
-          fi
-
       - name: Install frontend dependencies
         run: npm ci
+
+      - name: Versions match
+        if: runner.os == 'Linux'
+        run: node scripts/check-versions.cjs
 
       - name: TypeScript check
         if: runner.os == 'Linux'
@@ -70,24 +66,11 @@ jobs:
         working-directory: src-tauri
         run: cargo fmt --check
 
-      - name: Rust clippy
-        working-directory: src-tauri
-        run: cargo clippy --all-targets -- -D warnings
-
       - name: Rust tests
         working-directory: src-tauri
         run: cargo test
 
-  audit:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install cargo-audit
-        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
-        with:
-          tool: cargo-audit
-
-      - name: Audit Rust dependencies
+      - name: Rust clippy
         working-directory: src-tauri
-        run: cargo audit
+        run: cargo clippy --all-targets -- -D warnings
+

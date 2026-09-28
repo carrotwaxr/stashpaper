@@ -9,7 +9,7 @@ System tray app that rotates desktop wallpapers from a Stash server's images: a 
 - Build: `npm run build` (frontend), `cargo tauri build` (bundles)
 - Audit: `cd src-tauri && cargo audit`
 
-CI runs all of these on Linux, Windows and macOS. Run them before committing.
+Run them all before committing. CI runs tests, clippy and the frontend build on Linux, Windows and macOS, fmt, tsc and a version check on Linux, and audits in a separate scheduled workflow. `cargo tauri build` runs only for release tags.
 
 ## Conventions that differ from defaults
 - The version lives in `src-tauri/Cargo.toml` and `package.json` only; `tauri.conf.json` has none on purpose. CI fails when the two differ.
@@ -19,6 +19,7 @@ CI runs all of these on Linux, Windows and macOS. Run them before committing.
 - Settings are a plain JSON file in the app config dir (`~/.config/com.stashpaper.app/settings.json` on Linux), mode 600 because it holds the API key.
 
 ## Pitfalls
+- CI pins Rust (`toolchain:` in `ci.yml` and `release.yml`, kept equal). A newer local stable can flag lints CI doesn't know yet, and an older one misses lints CI enforces: `rustup update` when they disagree.
 - GNOME dark mode reads `picture-uri-dark`, and the `wallpaper` crate only sets `picture-uri`: set both. Set `picture-options` explicitly too, or leaving per-monitor (spanned) mode keeps the spanned layout.
 - Desktops cache wallpapers by path, so each download gets a unique timestamped filename. Reusing a path means the wallpaper doesn't visibly change.
 - GNOME has no per-monitor wallpapers. Per-monitor mode composites the images onto one canvas and sets it as `spanned`.

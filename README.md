@@ -13,7 +13,7 @@ Built with [Tauri v2](https://v2.tauri.app/) (Rust backend) and React.
 - **Per-monitor wallpapers**: A different image on each monitor, stitched into one spanned wallpaper (tested on GNOME)
 - **Test query**: Preview how many images match your filter before saving
 - **System tray**: Next wallpaper, Pause/Resume, Settings, Quit
-- **Error indication**: Tray icon changes on errors with tooltip showing the issue
+- **Error indication**: Tray icon changes on errors, with the error in its tooltip (tooltips aren't shown on Linux)
 - **Cross-platform**: Linux, Windows, macOS
 
 ## Install
