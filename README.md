@@ -12,8 +12,10 @@ Built with [Tauri v2](https://v2.tauri.app/) (Rust backend) and React.
 - **Minimum resolution filtering**: Only use images above 720p, 1080p, 1440p, or 4K
 - **Per-monitor wallpapers**: A different image on each monitor, stitched into one spanned wallpaper (tested on GNOME)
 - **Test query**: Preview how many images match your filter before saving
-- **System tray**: Next wallpaper, Pause/Resume, Settings, Quit
-- **Error indication**: Tray icon changes on errors, with the error in its tooltip (tooltips aren't shown on Linux)
+- **System tray**: a status line (last change, paused, or the current error), Next wallpaper, Pause/Resume, Open in Stash, Settings, Quit
+- **Error indication**: Tray icon turns red on errors, and the status line says what went wrong
+- **Keeps time across sleep and restarts**: the interval counts wall-clock time, so a daily wallpaper changes daily even on a laptop that sleeps; after a failure it retries within minutes
+- **Start at login**: one checkbox in Settings
 - **Cross-platform**: Linux, Windows, macOS
 
 ## Install
@@ -76,6 +78,7 @@ Open the `.dmg` and drag StashPaper to Applications.
 5. Optionally add a **Query Filter** to select specific images (see below)
 6. Click **Test Query** to see how many images match
 7. **Save Settings** and wallpapers will start rotating
+8. Optionally tick **Start StashPaper when I log in**
 
 ### Query Filter
 
@@ -157,6 +160,16 @@ Settings are stored in your OS config directory:
 | macOS | `~/Library/Application Support/com.stashpaper.app/settings.json` |
 
 The settings file has restrictive permissions (owner-only read/write) since it contains your Stash API key.
+
+The app also keeps a small `state.json` (when it last rotated and where it is in the rotation) and a log file:
+
+| OS | State | Logs |
+|----|-------|------|
+| Linux | `~/.local/share/com.stashpaper.app/` | `~/.local/share/com.stashpaper.app/logs/` |
+| Windows | `%APPDATA%\com.stashpaper.app\` | `%LOCALAPPDATA%\com.stashpaper.app\logs\` |
+| macOS | `~/Library/Application Support/com.stashpaper.app/` | `~/Library/Logs/com.stashpaper.app/` |
+
+Only one copy of StashPaper runs at a time; launching it again opens the running copy's settings.
 
 ## License
 

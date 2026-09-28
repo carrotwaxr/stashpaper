@@ -2,21 +2,22 @@ mod compositor;
 mod engine;
 mod error;
 mod rotation;
+mod schedule;
 mod settings;
 mod stash;
+mod tray;
 
 use error::AppError;
 use settings::Settings;
 use std::sync::Arc;
 use tauri::{
     image::Image,
-    menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Manager,
 };
+use tauri_plugin_autostart::ManagerExt as _;
+use tauri_plugin_opener::OpenerExt as _;
 use tokio::sync::RwLock;
-
-const TRAY_ID: &str = "main-tray";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MonitorInfo {
@@ -32,44 +33,37 @@ struct AppState {
     engine_tx: engine::CommandTx,
 }
 
-struct TrayIcons {
-    normal: Image<'static>,
-    error: Image<'static>,
+fn show_settings_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
 }
 
-/// Apply a grayscale + red tint to RGBA icon data to produce an "error" variant.
-fn make_error_icon(rgba: &[u8], width: u32, height: u32) -> Image<'static> {
-    let mut tinted = rgba.to_vec();
-    for pixel in tinted.as_chunks_mut::<4>().0 {
-        let r = pixel[0] as f32;
-        let g = pixel[1] as f32;
-        let b = pixel[2] as f32;
-        let gray = 0.299 * r + 0.587 * g + 0.114 * b;
-        pixel[0] = (gray * 1.4).min(255.0) as u8;
-        pixel[1] = (gray * 0.4).min(255.0) as u8;
-        pixel[2] = (gray * 0.4).min(255.0) as u8;
-        // alpha unchanged
-    }
-    Image::new_owned(tinted, width, height)
+fn send_to_engine(tx: &engine::CommandTx, command: engine::Command) {
+    let tx = tx.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = tx.send(command).await;
+    });
 }
 
-/// Update the tray icon and tooltip based on error state.
-pub fn update_tray_icon(app: &tauri::AppHandle, is_error: bool, message: Option<&str>) {
-    if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        let icons = app.state::<TrayIcons>();
-        let icon = if is_error {
-            &icons.error
-        } else {
-            &icons.normal
-        };
-        let _ = tray.set_icon(Some(icon.clone()));
-        let tooltip = match (is_error, message) {
-            (false, _) => "StashPaper".to_string(),
-            (true, Some(msg)) => format!("StashPaper - {}", msg),
-            (true, None) => "StashPaper - Error".to_string(),
-        };
-        let _ = tray.set_tooltip(Some(&tooltip));
-    }
+#[tauri::command]
+fn get_autostart(app: tauri::AppHandle) -> Result<bool, AppError> {
+    app.autolaunch()
+        .is_enabled()
+        .map_err(|e| AppError::Settings(e.to_string()))
+}
+
+#[tauri::command]
+fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<(), AppError> {
+    let autolaunch = app.autolaunch();
+    let result = if enabled {
+        autolaunch.enable()
+    } else {
+        autolaunch.disable()
+    };
+    result.map_err(|e| AppError::Settings(e.to_string()))
 }
 
 #[tauri::command]
@@ -175,6 +169,23 @@ async fn test_query(new_settings: Settings) -> Result<usize, AppError> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Must be registered first: a second launch hands over to the running
+        // instance and exits before anything else starts
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_settings_window(app);
+        }))
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .level(log::LevelFilter::Info)
+                .max_file_size(1_000_000)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(3))
+                .build(),
+        )
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .app_name("StashPaper")
+                .build(),
+        )
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             get_settings,
@@ -186,6 +197,8 @@ pub fn run() {
             next_wallpaper,
             pause_rotation,
             resume_rotation,
+            get_autostart,
+            set_autostart,
         ])
         .setup(|app| {
             // Load settings
@@ -201,14 +214,7 @@ pub fn run() {
                 settings: shared_settings.clone(),
                 engine_tx: tx.clone(),
             });
-
-            // Build tray menu
-            let next_item = MenuItem::with_id(app, "next", "Next Wallpaper", true, None::<&str>)?;
-            let pause_item = MenuItem::with_id(app, "pause", "Pause", true, None::<&str>)?;
-            let settings_item = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
-            let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu =
-                Menu::with_items(app, &[&next_item, &pause_item, &settings_item, &quit_item])?;
+            app.manage(tray::OpenUrls::default());
 
             // Generate normal + error tray icons (must own the data for 'static)
             let icon_ref = app.default_window_icon().unwrap();
@@ -217,47 +223,36 @@ pub fn run() {
                 icon_ref.width(),
                 icon_ref.height(),
             );
-            let error_icon = make_error_icon(icon_ref.rgba(), icon_ref.width(), icon_ref.height());
-            app.manage(TrayIcons {
+            let error_icon =
+                tray::make_error_icon(icon_ref.rgba(), icon_ref.width(), icon_ref.height());
+            app.manage(tray::TrayIcons {
                 normal: normal_icon.clone(),
                 error: error_icon,
             });
 
-            // Clone tx for tray menu closure
+            // The engine replaces this menu as soon as it starts
+            let menu = tray::build_menu(app.handle(), &tray::TrayStatus::default())?;
             let tray_tx = tx.clone();
-            let _tray = TrayIconBuilder::with_id(TRAY_ID)
+            let _tray = TrayIconBuilder::with_id(tray::TRAY_ID)
                 .icon(normal_icon)
                 .tooltip("StashPaper")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
-                .on_menu_event(move |app, event| {
-                    let tx = tray_tx.clone();
-                    match event.id.as_ref() {
-                        "next" => {
-                            tauri::async_runtime::spawn(async move {
-                                let _ = tx.send(engine::Command::Next).await;
-                            });
-                        }
-                        "pause" => {
-                            tauri::async_runtime::spawn(async move {
-                                let _ = tx.send(engine::Command::Pause).await;
-                            });
-                        }
-                        "settings" => {
-                            if let Some(window) = app.get_webview_window("main") {
-                                let _ = window.show();
-                                let _ = window.unminimize();
-                                let _ = window.set_focus();
+                .on_menu_event(move |app, event| match event.id.as_ref() {
+                    tray::NEXT => send_to_engine(&tray_tx, engine::Command::Next),
+                    tray::PAUSE => send_to_engine(&tray_tx, engine::Command::Pause),
+                    tray::RESUME => send_to_engine(&tray_tx, engine::Command::Resume),
+                    tray::SETTINGS => show_settings_window(app),
+                    tray::QUIT => {
+                        send_to_engine(&tray_tx, engine::Command::Quit);
+                        app.exit(0);
+                    }
+                    id => {
+                        if let Some(url) = tray::open_url_for(app, id) {
+                            if let Err(e) = app.opener().open_url(url, None::<&str>) {
+                                log::warn!("Couldn't open the image in Stash: {}", e);
                             }
                         }
-                        "quit" => {
-                            let tx = tx.clone();
-                            tauri::async_runtime::spawn(async move {
-                                let _ = tx.send(engine::Command::Quit).await;
-                            });
-                            app.exit(0);
-                        }
-                        _ => {}
                     }
                 })
                 .on_tray_icon_event(|tray, event| {
@@ -267,12 +262,7 @@ pub fn run() {
                         ..
                     } = event
                     {
-                        let app = tray.app_handle();
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.unminimize();
-                            let _ = window.set_focus();
-                        }
+                        show_settings_window(tray.app_handle());
                     }
                 })
                 .build(app)?;
@@ -289,10 +279,7 @@ pub fn run() {
 
             // Show settings on first run
             if first_run {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
+                show_settings_window(app.handle());
             }
 
             // Start rotation engine
@@ -306,44 +293,4 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_make_error_icon_grayscale_red_tint() {
-        // White pixel: R=255, G=255, B=255, A=255
-        // gray = 0.299*255 + 0.587*255 + 0.114*255 = 255
-        // R = 255*1.4 = clamped 255, G = 255*0.4 = 102, B = 255*0.4 = 102
-        let white_pixel = [255u8, 255, 255, 255];
-        let result = make_error_icon(&white_pixel, 1, 1);
-        let rgba = result.rgba();
-        assert_eq!(rgba[0], 255); // R clamped
-        assert_eq!(rgba[1], 102); // G dimmed
-        assert_eq!(rgba[2], 102); // B dimmed
-        assert_eq!(rgba[3], 255); // A preserved
-    }
-
-    #[test]
-    fn test_make_error_icon_preserves_transparency() {
-        // Transparent pixel
-        let transparent = [100u8, 200, 50, 0];
-        let result = make_error_icon(&transparent, 1, 1);
-        let rgba = result.rgba();
-        assert_eq!(rgba[3], 0); // alpha unchanged
-    }
-
-    #[test]
-    fn test_make_error_icon_pure_green_gets_red_shift() {
-        // Pure green: R=0, G=255, B=0, A=255
-        // gray = 0.587*255 ≈ 149.685
-        let green = [0u8, 255, 0, 255];
-        let result = make_error_icon(&green, 1, 1);
-        let rgba = result.rgba();
-        // R should be significantly higher than G and B
-        assert!(rgba[0] > rgba[1]);
-        assert!(rgba[0] > rgba[2]);
-    }
 }

@@ -125,10 +125,7 @@ pub fn load(app: &tauri::AppHandle) -> Result<Settings, AppError> {
     match serde_json::from_str(&contents) {
         Ok(settings) => Ok(settings),
         Err(e) => {
-            eprintln!(
-                "[StashPaper] Failed to parse settings, using defaults: {}",
-                e
-            );
+            log::warn!("Failed to parse settings, using defaults: {}", e);
             Ok(Settings::default())
         }
     }
