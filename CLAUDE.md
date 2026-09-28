@@ -1,121 +1,27 @@
 # StashPaper
 
-Desktop system tray app that rotates wallpapers from a Stash media server. Tauri v2 (Rust backend) + React frontend.
+System tray app that rotates desktop wallpapers from a Stash server's images: a Tauri v2 Rust backend in `src-tauri/` plus one React settings window, released for Linux, Windows and macOS and used day to day on Linux/GNOME.
 
-## Tech Stack
+## Commands
+- Dev: `cargo tauri dev` (starts Vite and the app)
+- Test: `cd src-tauri && cargo test`
+- Lint: `cd src-tauri && cargo fmt --check && cargo clippy --all-targets -- -D warnings`, then `npx tsc --noEmit`
+- Build: `npm run build` (frontend), `cargo tauri build` (bundles)
+- Audit: `cd src-tauri && cargo audit`
 
-- **Frontend**: React 19, Vite 7, Tailwind CSS 4, TypeScript 5.8
-- **Backend**: Tauri v2 (Rust), Tokio, Reqwest, `wallpaper` crate
-- **Stash API**: GraphQL via `findImages` query with `filter` + `image_filter` variables
-- **Storage**: JSON settings file in OS app config directory (`~/.config/stashpaper/`)
+CI runs all of these on Linux, Windows and macOS. Run them before committing.
 
-## Quick Reference
+## Conventions that differ from defaults
+- The version lives in `src-tauri/Cargo.toml` and `package.json` only; `tauri.conf.json` has none on purpose. CI fails when the two differ.
+- Every Stash query goes through `build_variables()` in `stash.rs`, which merges pagination, the minimum-resolution filter and the random seed into the user's filter JSON. Don't assemble GraphQL variables anywhere else.
+- `src/lib/types.ts` mirrors the Rust `Settings` struct by hand. Change both together.
+- `Settings` is `#[serde(default)]` so old settings files keep loading. Add fields with defaults; don't rename or retype one without a migration.
+- Settings are a plain JSON file in the app config dir (`~/.config/com.stashpaper.app/settings.json` on Linux), mode 600 because it holds the API key.
 
-```bash
-# Dev (starts both Vite + Tauri)
-cargo tauri dev
-
-# Build
-cargo tauri build
-
-# Rust tests
-cd src-tauri && cargo test
-
-# Type check frontend
-npx tsc --noEmit
-
-# Frontend build only
-npm run build
-```
-
-## Architecture
-
-```
-┌─────────────────────────────────┐
-│ System Tray (Tauri)             │
-│ Next | Pause | Settings | Quit  │
-└────────┬────────────────────────┘
-         │
-┌────────▼────────────────────────┐
-│ Rotation Engine (engine.rs)     │
-│ Timer loop + command channel    │
-│ Commands: Next/Pause/Resume/Quit│
-└────────┬────────────────────────┘
-         │
-┌────────▼────────────────────────┐     ┌───────────────────────┐
-│ Rotation State (rotation.rs)    │     │ Settings (settings.rs)│
-│ Random / Sequential / Shuffle   │     │ JSON persistence      │
-└────────┬────────────────────────┘     │ 0o600 file perms      │
-         │                              └───────────────────────┘
-┌────────▼────────────────────────┐
-│ Stash Client (stash.rs)         │
-│ GraphQL: findImages query       │
-│ Auth: ApiKey header             │
-│ Download → cache dir            │
-└─────────────────────────────────┘
-         │
-┌────────▼────────────────────────┐
-│ wallpaper crate                 │
-│ + GNOME dark mode gsettings     │
-└─────────────────────────────────┘
-```
-
-### Settings Window (React)
-
-Single-window settings UI at 520x680, shown on first run or tray click. Sections: Stash Connection, Query Filter (JSON), Rotation, Display. Window hides to tray on close.
-
-### Stash GraphQL Integration
-
-Query pattern: `findImages(filter: $filter, image_filter: $image_filter)` where user provides the full JSON for both filter objects. The engine merges in `per_page: 1` and `page: N` for pagination. Auth via `ApiKey` header.
-
-### Platform Notes
-
-- **GNOME/Linux**: Dark mode requires setting both `picture-uri` and `picture-uri-dark` via gsettings
-- **WebKitGTK**: Dropdown `<select>` elements need explicit styling to be readable
-- Cache files use timestamp-based unique filenames for cache busting
-
-## Key Files
-
-| File | Purpose |
-|------|---------|
-| `src-tauri/src/lib.rs` | Tauri setup, command registration, system tray, window management |
-| `src-tauri/src/engine.rs` | Rotation timer loop, command handling, wallpaper setting |
-| `src-tauri/src/rotation.rs` | Random/Sequential/Shuffle state machine |
-| `src-tauri/src/stash.rs` | GraphQL client, image download, variables builder |
-| `src-tauri/src/settings.rs` | Settings struct, JSON persistence, validation |
-| `src-tauri/src/error.rs` | Custom error type (Stash/Wallpaper/Settings) |
-| `src/components/Settings.tsx` | Settings UI panel (connection, filter, rotation, display) |
-| `src/lib/types.ts` | TypeScript types mirroring Rust settings |
-
-## Skill Directory
-
-| Area | Skill | What it covers |
-|------|-------|----------------|
-| **Stash API** | `stash:stash` | GraphQL API, plugin system, scraper system |
-| **Stash-Box** | `stash:stash-box` | StashDB metadata API, edit/voting workflow, fingerprints |
-| **Frontend** | `frontend-design` | Component design, polish, avoiding generic AI aesthetics |
-| **Git workflow** | `fluffer:git-pr` | Commit conventions, branching, PR workflow |
-| **Testing (Rust)** | — | `cargo test` in src-tauri; unit tests for rotation, stash, settings |
-
-## Development Lifecycle
-
-### Working on changes
-
-1. **Orient** → Read CLAUDE.md, check git status, check memory for prior context
-2. **Plan** → For non-trivial work, use `fluffer:plan-write` or `EnterPlanMode`
-3. **Implement** → Write code, run `cargo test` and `npx tsc --noEmit` frequently
-4. **Verify** → run the checks and show the output (`/fluffer:code-verify`)
-5. **Review** → `/fluffer:code-review` for a review team before the PR
-6. **Complete** → finish the branch as `fluffer:git-pr` describes
-
-### Lifecycle Gates
-
-**Before committing:**
-- Rust tests pass: `cd src-tauri && cargo test`
-- TypeScript compiles: `npx tsc --noEmit`
-- Frontend builds: `npm run build`
-
-**Before creating a PR:**
-- All above gates pass
-- Self-review completed
-- Commit messages follow conventional format (feat/fix/docs/refactor/chore)
+## Pitfalls
+- GNOME dark mode reads `picture-uri-dark`, and the `wallpaper` crate only sets `picture-uri`: set both. Set `picture-options` explicitly too, or leaving per-monitor (spanned) mode keeps the spanned layout.
+- Desktops cache wallpapers by path, so each download gets a unique timestamped filename. Reusing a path means the wallpaper doesn't visibly change.
+- GNOME has no per-monitor wallpapers. Per-monitor mode composites the images onto one canvas and sets it as `spanned`.
+- WebKitGTK renders `<select>` options unreadable unless both the select and each option get explicit `color` and `backgroundColor` styles.
+- Linux tray: the app panics at startup without `libayatana-appindicator3` (or `libappindicator3`). Tray tooltips and left-click events don't exist on Linux, so anything shown only there is invisible to Linux users.
+- `default_window_icon()` returns a borrowed image. Use `Image::new_owned` to keep one in managed state.

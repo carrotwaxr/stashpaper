@@ -10,6 +10,7 @@ Built with [Tauri v2](https://v2.tauri.app/) (Rust backend) and React.
 - **Rotation modes**: Random (seeded, no repeats), Sequential, Shuffle
 - **Query filtering**: Full control over which images are selected using Stash's GraphQL filter syntax
 - **Minimum resolution filtering**: Only use images above 720p, 1080p, 1440p, or 4K
+- **Per-monitor wallpapers**: A different image on each monitor, stitched into one spanned wallpaper (tested on GNOME)
 - **Test query**: Preview how many images match your filter before saving
 - **System tray**: Next wallpaper, Pause/Resume, Settings, Quit
 - **Error indication**: Tray icon changes on errors with tooltip showing the issue
@@ -58,7 +59,13 @@ Run the `.exe` installer. WebView2 is required but comes pre-installed on Window
 
 Open the `.dmg` and drag StashPaper to Applications.
 
-> **Note:** StashPaper is not signed with an Apple Developer certificate. macOS will block the first launch with "app is damaged." To open it: right-click the app > Open > Open. You only need to do this once.
+> **Note:** StashPaper is not signed with an Apple Developer certificate, so macOS blocks the first launch with "StashPaper is damaged and can't be opened." Right-click > Open doesn't get past that message. Clear the download quarantine flag once instead:
+>
+> ```bash
+> xattr -dr com.apple.quarantine /Applications/StashPaper.app
+> ```
+>
+> If macOS instead says it "cannot verify the developer", open **System Settings > Privacy & Security** and click **Open Anyway**.
 
 ## Setup
 
@@ -145,7 +152,7 @@ Settings are stored in your OS config directory:
 
 | OS | Path |
 |----|------|
-| Linux | `~/.config/stashpaper/settings.json` |
+| Linux | `~/.config/com.stashpaper.app/settings.json` |
 | Windows | `%APPDATA%\com.stashpaper.app\settings.json` |
 | macOS | `~/Library/Application Support/com.stashpaper.app/settings.json` |
 
