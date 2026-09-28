@@ -1,9 +1,9 @@
+mod compositor;
 mod engine;
 mod error;
 mod rotation;
 mod settings;
 mod stash;
-mod compositor;
 
 use error::AppError;
 use settings::Settings;
@@ -133,16 +133,13 @@ struct MonitorResolution {
 
 #[tauri::command]
 async fn detect_monitor_resolution(app: tauri::AppHandle) -> Option<MonitorResolution> {
-    app.primary_monitor()
-        .ok()
-        .flatten()
-        .map(|monitor| {
-            let size = monitor.size();
-            MonitorResolution {
-                width: size.width,
-                height: size.height,
-            }
-        })
+    app.primary_monitor().ok().flatten().map(|monitor| {
+        let size = monitor.size();
+        MonitorResolution {
+            width: size.width,
+            height: size.height,
+        }
+    })
 }
 
 #[tauri::command]
@@ -243,18 +240,12 @@ pub fn run() {
             });
 
             // Build tray menu
-            let next_item =
-                MenuItem::with_id(app, "next", "Next Wallpaper", true, None::<&str>)?;
-            let pause_item =
-                MenuItem::with_id(app, "pause", "Pause", true, None::<&str>)?;
-            let settings_item =
-                MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
-            let quit_item =
-                MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(
-                app,
-                &[&next_item, &pause_item, &settings_item, &quit_item],
-            )?;
+            let next_item = MenuItem::with_id(app, "next", "Next Wallpaper", true, None::<&str>)?;
+            let pause_item = MenuItem::with_id(app, "pause", "Pause", true, None::<&str>)?;
+            let settings_item = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+            let menu =
+                Menu::with_items(app, &[&next_item, &pause_item, &settings_item, &quit_item])?;
 
             // Generate normal + error tray icons (must own the data for 'static)
             let icon_ref = app.default_window_icon().unwrap();
@@ -263,8 +254,7 @@ pub fn run() {
                 icon_ref.width(),
                 icon_ref.height(),
             );
-            let error_icon =
-                make_error_icon(icon_ref.rgba(), icon_ref.width(), icon_ref.height());
+            let error_icon = make_error_icon(icon_ref.rgba(), icon_ref.width(), icon_ref.height());
             app.manage(TrayIcons {
                 normal: normal_icon.clone(),
                 error: error_icon,
