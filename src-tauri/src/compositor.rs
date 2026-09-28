@@ -142,7 +142,7 @@ mod tests {
             height: 1080,
         }];
 
-        composite_wallpaper(&[img_path.clone()], &monitors, &output).unwrap();
+        composite_wallpaper(std::slice::from_ref(&img_path), &monitors, &output).unwrap();
 
         let result = image::open(&output).unwrap();
         let (w, h) = result.dimensions();
@@ -249,7 +249,7 @@ mod tests {
         let img_path = make_test_image(100, 100, 128, 128, 128);
         let output = env::temp_dir().join("stashpaper_test_empty_monitors.png");
 
-        let result = composite_wallpaper(&[img_path.clone()], &[], &output);
+        let result = composite_wallpaper(std::slice::from_ref(&img_path), &[], &output);
         assert!(result.is_err());
 
         let err_msg = result.unwrap_err().to_string();

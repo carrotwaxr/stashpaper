@@ -169,46 +169,6 @@ async fn test_query(new_settings: Settings) -> Result<usize, AppError> {
     stash::test_query(&new_settings).await
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_make_error_icon_grayscale_red_tint() {
-        // White pixel: R=255, G=255, B=255, A=255
-        // gray = 0.299*255 + 0.587*255 + 0.114*255 = 255
-        // R = 255*1.4 = clamped 255, G = 255*0.4 = 102, B = 255*0.4 = 102
-        let white_pixel = [255u8, 255, 255, 255];
-        let result = make_error_icon(&white_pixel, 1, 1);
-        let rgba = result.rgba();
-        assert_eq!(rgba[0], 255); // R clamped
-        assert_eq!(rgba[1], 102); // G dimmed
-        assert_eq!(rgba[2], 102); // B dimmed
-        assert_eq!(rgba[3], 255); // A preserved
-    }
-
-    #[test]
-    fn test_make_error_icon_preserves_transparency() {
-        // Transparent pixel
-        let transparent = [100u8, 200, 50, 0];
-        let result = make_error_icon(&transparent, 1, 1);
-        let rgba = result.rgba();
-        assert_eq!(rgba[3], 0); // alpha unchanged
-    }
-
-    #[test]
-    fn test_make_error_icon_pure_green_gets_red_shift() {
-        // Pure green: R=0, G=255, B=0, A=255
-        // gray = 0.587*255 ≈ 149.685
-        let green = [0u8, 255, 0, 255];
-        let result = make_error_icon(&green, 1, 1);
-        let rgba = result.rgba();
-        // R should be significantly higher than G and B
-        assert!(rgba[0] > rgba[1]);
-        assert!(rgba[0] > rgba[2]);
-    }
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -343,4 +303,44 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_make_error_icon_grayscale_red_tint() {
+        // White pixel: R=255, G=255, B=255, A=255
+        // gray = 0.299*255 + 0.587*255 + 0.114*255 = 255
+        // R = 255*1.4 = clamped 255, G = 255*0.4 = 102, B = 255*0.4 = 102
+        let white_pixel = [255u8, 255, 255, 255];
+        let result = make_error_icon(&white_pixel, 1, 1);
+        let rgba = result.rgba();
+        assert_eq!(rgba[0], 255); // R clamped
+        assert_eq!(rgba[1], 102); // G dimmed
+        assert_eq!(rgba[2], 102); // B dimmed
+        assert_eq!(rgba[3], 255); // A preserved
+    }
+
+    #[test]
+    fn test_make_error_icon_preserves_transparency() {
+        // Transparent pixel
+        let transparent = [100u8, 200, 50, 0];
+        let result = make_error_icon(&transparent, 1, 1);
+        let rgba = result.rgba();
+        assert_eq!(rgba[3], 0); // alpha unchanged
+    }
+
+    #[test]
+    fn test_make_error_icon_pure_green_gets_red_shift() {
+        // Pure green: R=0, G=255, B=0, A=255
+        // gray = 0.587*255 ≈ 149.685
+        let green = [0u8, 255, 0, 255];
+        let result = make_error_icon(&green, 1, 1);
+        let rgba = result.rgba();
+        // R should be significantly higher than G and B
+        assert!(rgba[0] > rgba[1]);
+        assert!(rgba[0] > rgba[2]);
+    }
 }
