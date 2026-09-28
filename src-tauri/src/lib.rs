@@ -243,6 +243,20 @@ pub fn run() {
                     tray::PAUSE => send_to_engine(&tray_tx, engine::Command::Pause),
                     tray::RESUME => send_to_engine(&tray_tx, engine::Command::Resume),
                     tray::SETTINGS => show_settings_window(app),
+                    tray::LOGS => {
+                        let opened = app
+                            .path()
+                            .app_log_dir()
+                            .map_err(|e| e.to_string())
+                            .and_then(|dir| {
+                                app.opener()
+                                    .open_path(dir.to_string_lossy(), None::<&str>)
+                                    .map_err(|e| e.to_string())
+                            });
+                        if let Err(e) = opened {
+                            log::warn!("Couldn't open the log folder: {}", e);
+                        }
+                    }
                     tray::QUIT => {
                         send_to_engine(&tray_tx, engine::Command::Quit);
                         app.exit(0);

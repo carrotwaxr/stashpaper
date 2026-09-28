@@ -16,6 +16,7 @@ pub const NEXT: &str = "next";
 pub const PAUSE: &str = "pause";
 pub const RESUME: &str = "resume";
 pub const SETTINGS: &str = "settings";
+pub const LOGS: &str = "logs";
 pub const QUIT: &str = "quit";
 pub const OPEN_PREFIX: &str = "open:";
 
@@ -24,14 +25,25 @@ pub struct TrayIcons {
     pub error: Image<'static>,
 }
 
+/// One "Open in Stash" entry: the image on one monitor (label empty when
+/// there's only one image).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OpenItem {
+    pub label: String,
+    pub url: String,
+}
+
 /// What the tray shows.
 #[derive(Debug, Clone, Default)]
 pub struct TrayStatus {
+    /// A Stash URL is set
+    pub configured: bool,
     pub paused: bool,
     pub last_changed: Option<SystemTime>,
     pub error: Option<String>,
-    /// Stash pages of the images on the desktop, one per monitor
-    pub open_urls: Vec<String>,
+    /// When the engine retries after `error`
+    pub retry_at: Option<SystemTime>,
+    pub open: Vec<OpenItem>,
 }
 
 /// The URLs behind the "Open in Stash" items, for the menu event handler.
@@ -62,38 +74,67 @@ fn truncate(text: &str, max_chars: usize) -> String {
     format!("{}...", cut.trim_end())
 }
 
+fn local(time: SystemTime) -> chrono::DateTime<chrono::Local> {
+    chrono::DateTime::<chrono::Local>::from(time)
+}
+
+/// "at 14:05", "yesterday at 14:05" or "on Sep 26 at 14:05", relative to `now`.
+fn when(time: SystemTime, now: SystemTime) -> String {
+    let (time, now) = (local(time), local(now));
+    let clock = time.format("%H:%M");
+    let days = now
+        .date_naive()
+        .signed_duration_since(time.date_naive())
+        .num_days();
+    match days {
+        0 => format!("at {}", clock),
+        1 => format!("yesterday at {}", clock),
+        _ => format!("on {} at {}", time.format("%b %-d"), clock),
+    }
+}
+
 /// The first, disabled menu line. Linux trays show no tooltip, so this is the
 /// only place a Linux user sees what the app is doing.
-pub fn status_line(status: &TrayStatus) -> String {
+pub fn status_line(status: &TrayStatus, now: SystemTime) -> String {
+    if !status.configured {
+        return "Not set up yet: open Settings".into();
+    }
     if status.paused {
-        return "Paused".into();
+        return match status.error {
+            Some(_) => "Paused (the last try failed)".into(),
+            None => "Paused".into(),
+        };
     }
     if let Some(error) = &status.error {
-        return format!("Error: {}", truncate(error, 70));
+        let line = match status.retry_at {
+            Some(retry) => format!("Retrying {}: {}", when(retry, now), error),
+            None => error.clone(),
+        };
+        return truncate(&line, 80);
     }
     match status.last_changed {
-        Some(time) => format!(
-            "Changed at {}",
-            chrono::DateTime::<chrono::Local>::from(time).format("%H:%M")
-        ),
+        Some(time) => format!("Changed {}", when(time, now)),
         None => "Waiting for the first wallpaper".into(),
     }
 }
 
-fn tooltip(status: &TrayStatus) -> String {
-    match &status.error {
-        Some(error) => format!("StashPaper - {}", error),
-        None => format!("StashPaper - {}", status_line(status)),
-    }
+fn tooltip(status: &TrayStatus, now: SystemTime) -> String {
+    let text = match &status.error {
+        Some(error) => error.clone(),
+        None => status_line(status, now),
+    };
+    truncate(&format!("StashPaper - {}", text), 250)
 }
 
 pub fn build_menu(app: &AppHandle, status: &TrayStatus) -> tauri::Result<Menu<tauri::Wry>> {
-    let status_item = MenuItem::with_id(app, "status", status_line(status), false, None::<&str>)?;
-    let next = MenuItem::with_id(app, NEXT, "Next Wallpaper", true, None::<&str>)?;
+    let now = SystemTime::now();
+    let status_item =
+        MenuItem::with_id(app, "status", status_line(status, now), false, None::<&str>)?;
+    let next = MenuItem::with_id(app, NEXT, "Next Wallpaper", status.configured, None::<&str>)?;
     let pause = if status.paused {
         MenuItem::with_id(app, RESUME, "Resume", true, None::<&str>)?
     } else {
-        MenuItem::with_id(app, PAUSE, "Pause", true, None::<&str>)?
+        MenuItem::with_id(app, PAUSE, "Pause", status.configured, None::<&str>)?
     };
     let menu = Menu::with_items(
         app,
@@ -105,22 +146,22 @@ pub fn build_menu(app: &AppHandle, status: &TrayStatus) -> tauri::Result<Menu<ta
         ],
     )?;
 
-    match status.open_urls.len() {
-        0 => {}
-        1 => menu.append(&MenuItem::with_id(
+    match status.open.as_slice() {
+        [] => {}
+        [_] => menu.append(&MenuItem::with_id(
             app,
             format!("{}0", OPEN_PREFIX),
             "Open in Stash",
             true,
             None::<&str>,
         )?)?,
-        count => {
+        items => {
             let submenu = Submenu::with_id(app, "open", "Open in Stash", true)?;
-            for index in 0..count {
+            for (index, item) in items.iter().enumerate() {
                 submenu.append(&MenuItem::with_id(
                     app,
                     format!("{}{}", OPEN_PREFIX, index),
-                    format!("Monitor {}", index + 1),
+                    &item.label,
                     true,
                     None::<&str>,
                 )?)?;
@@ -129,8 +170,17 @@ pub fn build_menu(app: &AppHandle, status: &TrayStatus) -> tauri::Result<Menu<ta
         }
     }
 
+    menu.append(&PredefinedMenuItem::separator(app)?)?;
+    if status.error.is_some() {
+        menu.append(&MenuItem::with_id(
+            app,
+            LOGS,
+            "Open Log Folder",
+            true,
+            None::<&str>,
+        )?)?;
+    }
     menu.append_items(&[
-        &PredefinedMenuItem::separator(app)?,
         &MenuItem::with_id(app, SETTINGS, "Settings", true, None::<&str>)?,
         &MenuItem::with_id(app, QUIT, "Quit", true, None::<&str>)?,
     ])?;
@@ -139,7 +189,8 @@ pub fn build_menu(app: &AppHandle, status: &TrayStatus) -> tauri::Result<Menu<ta
 
 /// Bring the tray's menu, icon and tooltip in line with `status`.
 pub fn refresh(app: &AppHandle, status: &TrayStatus) {
-    *app.state::<OpenUrls>().0.lock().unwrap() = status.open_urls.clone();
+    *app.state::<OpenUrls>().0.lock().unwrap() =
+        status.open.iter().map(|item| item.url.clone()).collect();
 
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
         return;
@@ -159,7 +210,7 @@ pub fn refresh(app: &AppHandle, status: &TrayStatus) {
         &icons.normal
     };
     let _ = tray.set_icon(Some(icon.clone()));
-    let _ = tray.set_tooltip(Some(tooltip(status)));
+    let _ = tray.set_tooltip(Some(tooltip(status, SystemTime::now())));
 }
 
 /// The Stash URL behind an `open:<index>` menu id, if there is one.
@@ -212,43 +263,79 @@ mod tests {
         assert!(rgba[0] > rgba[2]);
     }
 
+    fn at(day: u32, hour: u32, minute: u32) -> SystemTime {
+        use chrono::TimeZone;
+        chrono::Local
+            .with_ymd_and_hms(2026, 9, day, hour, minute, 0)
+            .unwrap()
+            .into()
+    }
+
+    fn configured() -> TrayStatus {
+        TrayStatus {
+            configured: true,
+            ..TrayStatus::default()
+        }
+    }
+
     #[test]
     fn status_line_says_what_the_app_is_doing() {
-        let mut status = TrayStatus::default();
-        assert_eq!(status_line(&status), "Waiting for the first wallpaper");
-
-        status.last_changed = Some(SystemTime::now());
-        assert!(status_line(&status).starts_with("Changed at "));
-
-        status.error = Some("Stash rejected the API key (HTTP 401)".into());
+        let now = at(28, 16, 0);
         assert_eq!(
-            status_line(&status),
-            "Error: Stash rejected the API key (HTTP 401)"
+            status_line(&TrayStatus::default(), now),
+            "Not set up yet: open Settings"
         );
 
-        // pausing is the user's choice, so it wins over a stale error
+        let mut status = configured();
+        assert_eq!(status_line(&status, now), "Waiting for the first wallpaper");
+
+        status.last_changed = Some(at(28, 14, 5));
+        assert_eq!(status_line(&status, now), "Changed at 14:05");
+        status.last_changed = Some(at(27, 14, 5));
+        assert_eq!(status_line(&status, now), "Changed yesterday at 14:05");
+        status.last_changed = Some(at(26, 14, 5));
+        assert_eq!(status_line(&status, now), "Changed on Sep 26 at 14:05");
+
+        status.error = Some("Stash error: the API key was rejected (HTTP 401)".into());
+        status.retry_at = Some(at(28, 16, 1));
+        assert_eq!(
+            status_line(&status, now),
+            "Retrying at 16:01: Stash error: the API key was rejected (HTTP 401)"
+        );
+
+        // pausing is the user's choice, but a failure behind it still shows
         status.paused = true;
-        assert_eq!(status_line(&status), "Paused");
+        assert_eq!(status_line(&status, now), "Paused (the last try failed)");
+        status.error = None;
+        assert_eq!(status_line(&status, now), "Paused");
     }
 
     #[test]
     fn long_errors_are_cut_to_fit_a_menu() {
         let status = TrayStatus {
             error: Some("x".repeat(200)),
-            ..TrayStatus::default()
+            ..configured()
         };
-        let line = status_line(&status);
-        assert!(line.chars().count() <= "Error: ".len() + 70, "{line}");
+        let line = status_line(&status, SystemTime::now());
+        assert!(line.chars().count() <= 80, "{line}");
         assert!(line.ends_with("..."));
     }
 
     #[test]
-    fn tooltip_keeps_the_whole_error() {
-        let long = "y".repeat(200);
+    fn tooltip_shows_more_of_the_error_but_not_all_of_a_huge_one() {
         let status = TrayStatus {
-            error: Some(long.clone()),
-            ..TrayStatus::default()
+            error: Some("y".repeat(150)),
+            ..configured()
         };
-        assert_eq!(tooltip(&status), format!("StashPaper - {}", long));
+        assert_eq!(
+            tooltip(&status, SystemTime::now()),
+            format!("StashPaper - {}", "y".repeat(150))
+        );
+
+        let huge = TrayStatus {
+            error: Some("z".repeat(1000)),
+            ..configured()
+        };
+        assert!(tooltip(&huge, SystemTime::now()).chars().count() <= 250);
     }
 }

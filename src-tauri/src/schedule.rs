@@ -57,6 +57,18 @@ pub struct SavedState {
     /// The file on the desktop, so a failed rotation after a restart knows
     /// which cache file it must not delete
     pub current_wallpaper: Option<PathBuf>,
+    /// The images on the desktop, for "Open in Stash" after a restart
+    pub shown: Vec<ShownImage>,
+    /// Pausing sticks across restarts
+    pub paused: bool,
+}
+
+/// One image on the desktop: its Stash id and, with per-monitor wallpapers,
+/// which monitor it's on.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShownImage {
+    pub id: String,
+    pub label: String,
 }
 
 impl SavedState {
@@ -70,8 +82,12 @@ impl SavedState {
 /// applies while these are unchanged.
 pub fn selection_key(settings: &Settings) -> String {
     format!(
-        "{:?}|{:?}|{}",
-        settings.rotation_mode, settings.min_resolution, settings.query_filter
+        "{}|{:?}|{:?}|{}|{}",
+        settings.stash_url,
+        settings.rotation_mode,
+        settings.min_resolution,
+        settings.per_monitor,
+        settings.query_filter
     )
 }
 
@@ -181,7 +197,12 @@ mod tests {
             interval: crate::settings::Interval::Daily,
             ..Settings::default()
         };
+        let other_server = Settings {
+            stash_url: "http://other:9999".into(),
+            ..Settings::default()
+        };
         assert_ne!(selection_key(&base), selection_key(&other_filter));
+        assert_ne!(selection_key(&base), selection_key(&other_server));
         assert_eq!(selection_key(&base), selection_key(&other_interval));
     }
 
@@ -200,6 +221,11 @@ mod tests {
                 random_page: 3,
             },
             current_wallpaper: Some(PathBuf::from("/cache/wallpaper_1_0.jpg")),
+            shown: vec![ShownImage {
+                id: "12".into(),
+                label: "Monitor 1 (1920x1080)".into(),
+            }],
+            paused: true,
         };
         save(&path, &state).unwrap();
         assert_eq!(load(&path), state);

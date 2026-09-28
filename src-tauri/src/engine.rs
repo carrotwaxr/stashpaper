@@ -44,6 +44,20 @@ struct Engine {
     selection_key: String,
     /// The file the last successful rotation put on the desktop
     current: Option<PathBuf>,
+    /// The images on the desktop, for "Open in Stash"
+    shown: Vec<schedule::ShownImage>,
+}
+
+/// "Open in Stash" entries for the images on the desktop.
+fn open_items(stash_url: &str, shown: &[schedule::ShownImage]) -> Vec<crate::tray::OpenItem> {
+    let base = stash_url.trim_end_matches('/');
+    shown
+        .iter()
+        .map(|image| crate::tray::OpenItem {
+            label: image.label.clone(),
+            url: format!("{}/images/{}", base, image.id),
+        })
+        .collect()
 }
 
 impl Engine {
@@ -74,12 +88,16 @@ impl Engine {
             last_failure: None,
             failures: 0,
             status: TrayStatus {
+                configured: crate::settings::is_configured(settings),
+                paused: saved.paused,
                 last_changed: last_success,
+                open: open_items(&settings.stash_url, &saved.shown),
                 ..TrayStatus::default()
             },
             state_path,
             selection_key,
             current: saved.current_wallpaper,
+            shown: saved.shown,
         }
     }
 
@@ -94,6 +112,19 @@ impl Engine {
         }
         self.failures = 0;
         self.last_failure = None;
+        self.status.configured = crate::settings::is_configured(settings);
+        if !self.status.configured {
+            // Nothing will rotate until it is set up again, so an old error
+            // would only linger
+            self.status.error = None;
+            self.status.retry_at = None;
+        }
+    }
+
+    fn set_paused(&mut self, paused: bool, app: &tauri::AppHandle) {
+        self.status.paused = paused;
+        self.save();
+        crate::tray::refresh(app, &self.status);
     }
 
     async fn rotate_and_record(
@@ -112,39 +143,42 @@ impl Engine {
         )
         .await
         {
-            Ok((wallpaper_path, image_ids)) => {
+            Ok((wallpaper_path, shown)) => {
                 self.current = Some(wallpaper_path);
                 self.failures = 0;
                 self.last_failure = None;
                 self.last_success = Some(now);
                 self.status.error = None;
+                self.status.retry_at = None;
                 self.status.last_changed = Some(now);
-                let base = s.stash_url.trim_end_matches('/');
-                self.status.open_urls = image_ids
-                    .iter()
-                    .map(|id| format!("{}/images/{}", base, id))
-                    .collect();
-                self.save(&s, now);
+                self.status.open = open_items(&s.stash_url, &shown);
+                self.shown = shown;
+                self.selection_key = schedule::selection_key(&s);
+                self.save();
             }
             Err(e) => {
                 log::error!("Rotation failed: {}", e);
                 self.failures += 1;
                 self.last_failure = Some(now);
                 self.status.error = Some(e.to_string());
+                self.status.retry_at =
+                    Some(now + schedule::retry_delay(self.failures, s.interval.to_duration()));
             }
         }
         crate::tray::refresh(app, &self.status);
     }
 
-    fn save(&self, settings: &Settings, rotated_at: SystemTime) {
+    fn save(&self) {
         let Some(path) = &self.state_path else {
             return;
         };
         let state = schedule::SavedState {
-            last_rotated: Some(schedule::unix_secs(rotated_at)),
-            selection_key: schedule::selection_key(settings),
+            last_rotated: self.last_success.map(schedule::unix_secs),
+            selection_key: self.selection_key.clone(),
             rotation: self.rotation.snapshot(),
             current_wallpaper: self.current.clone(),
+            shown: self.shown.clone(),
+            paused: self.status.paused,
         };
         if let Err(e) = schedule::save(path, &state) {
             log::warn!("Couldn't save the rotation state: {}", e);
@@ -185,19 +219,15 @@ pub async fn run(mut rx: CommandRx, settings: Arc<RwLock<Settings>>, app: tauri:
                             engine.rotate_and_record(&settings, &app).await;
                         }
                     }
-                    Some(Command::Pause) => {
-                        engine.status.paused = true;
-                        crate::tray::refresh(&app, &engine.status);
-                    }
-                    Some(Command::Resume) => {
-                        engine.status.paused = false;
-                        crate::tray::refresh(&app, &engine.status);
-                    }
+                    Some(Command::Pause) => engine.set_paused(true, &app),
+                    Some(Command::Resume) => engine.set_paused(false, &app),
                     Some(Command::SettingsUpdated) => {
                         engine.settings_changed(&*settings.read().await);
                         // Show the new settings at work right away
-                        if crate::settings::is_configured(&*settings.read().await) {
+                        if engine.status.configured {
                             engine.rotate_and_record(&settings, &app).await;
+                        } else {
+                            crate::tray::refresh(&app, &engine.status);
                         }
                     }
                     Some(Command::Quit) | None => break,
@@ -458,14 +488,14 @@ fn apply_wallpaper(
     }
 }
 
-/// Run one rotation and return the Stash ids of the images now on the desktop.
+/// Run one rotation. Returns the file now on the desktop and the images on it.
 async fn rotate(
     s: &Settings,
     rotation_state: &mut RotationState,
     count_hint: &mut Option<usize>,
     current: Option<&Path>,
     app_handle: &tauri::AppHandle,
-) -> Result<(PathBuf, Vec<String>), AppError> {
+) -> Result<(PathBuf, Vec<schedule::ShownImage>), AppError> {
     let client = stash::client_for(s)?;
 
     let cache_dir = app_handle
@@ -478,8 +508,20 @@ async fn rotate(
     let wanted = if per_monitor { monitors.len() } else { 1 };
 
     let picked = download_batch(&client, s, rotation_state, count_hint, wanted, &cache_dir).await?;
-    let (images, ids): (Vec<PathBuf>, Vec<String>) =
-        picked.into_iter().map(|p| (p.path, p.id)).unzip();
+    let shown: Vec<schedule::ShownImage> = picked
+        .iter()
+        .enumerate()
+        .map(|(index, p)| schedule::ShownImage {
+            id: p.id.clone(),
+            label: match monitors.get(index) {
+                Some(m) if per_monitor => {
+                    format!("Monitor {} ({}x{})", index + 1, m.width, m.height)
+                }
+                _ => String::new(),
+            },
+        })
+        .collect();
+    let images: Vec<PathBuf> = picked.into_iter().map(|p| p.path).collect();
 
     let geoms: Vec<crate::compositor::MonitorGeometry> = monitors
         .iter()
@@ -513,7 +555,7 @@ async fn rotate(
     .await
     .map_err(|e| AppError::Wallpaper(e.to_string()))??;
 
-    Ok((wallpaper_path, ids))
+    Ok((wallpaper_path, shown))
 }
 
 fn set_wallpaper(path: &str, settings: &Settings) -> Result<(), AppError> {

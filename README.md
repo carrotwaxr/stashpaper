@@ -13,7 +13,7 @@ Built with [Tauri v2](https://v2.tauri.app/) (Rust backend) and React.
 - **Per-monitor wallpapers**: A different image on each monitor, stitched into one spanned wallpaper (tested on GNOME)
 - **Test query**: Preview how many images match your filter before saving
 - **System tray**: a status line (last change, paused, or the current error), Next wallpaper, Pause/Resume, Open in Stash, Settings, Quit
-- **Error indication**: Tray icon turns red on errors, and the status line says what went wrong
+- **Error indication**: Tray icon gets a red tint on errors, and the status line says what went wrong and when it retries
 - **Keeps time across sleep and restarts**: the interval counts wall-clock time, so a daily wallpaper changes daily even on a laptop that sleeps; after a failure it retries within minutes
 - **Start at login**: one checkbox in Settings
 - **Cross-platform**: Linux, Windows, macOS
@@ -78,7 +78,7 @@ Open the `.dmg` and drag StashPaper to Applications.
 5. Optionally add a **Query Filter** to select specific images (see below)
 6. Click **Test Query** to see how many images match
 7. **Save Settings** and wallpapers will start rotating
-8. Optionally tick **Start StashPaper when I log in**
+8. Optionally tick **Start StashPaper in the tray when I log in**. If you set up autostart by hand before (for example `~/.config/autostart/stashpaper.desktop`), remove that entry, or StashPaper opens its settings window at every login.
 
 ### Query Filter
 
