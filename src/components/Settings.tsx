@@ -84,6 +84,7 @@ export default function SettingsPanel() {
 
   function update<K extends keyof Settings>(key: K, value: Settings[K]) {
     setSettings((prev) => ({ ...prev, [key]: value }));
+    setSaveError(null);
     // Reset test result when query-affecting fields change
     if (key === "query_filter" || key === "min_resolution") {
       setTestResult({ status: "idle" });
@@ -141,7 +142,7 @@ export default function SettingsPanel() {
     try {
       parsed = JSON.parse(raw);
     } catch (e) {
-      return `Invalid JSON: ${(e as SyntaxError).message}`;
+      return `Not valid JSON (${(e as SyntaxError).message})`;
     }
     const isObject = (v: unknown) =>
       typeof v === "object" && v !== null && !Array.isArray(v);
@@ -150,7 +151,7 @@ export default function SettingsPanel() {
     }
     for (const [key, value] of Object.entries(parsed as object)) {
       if (key !== "filter" && key !== "image_filter") {
-        return `Unknown key "${key}": use filter and/or image_filter`;
+        return `Unknown key "${key}", use filter and/or image_filter`;
       }
       if (!isObject(value)) return `"${key}" must be a JSON object`;
     }
@@ -232,7 +233,7 @@ export default function SettingsPanel() {
           {queryFilterError ? (
             <p className="text-xs text-red-400 mt-1">{queryFilterError}</p>
           ) : settings.query_filter.trim() ? (
-            <p className="text-xs text-green-400 mt-1">Valid filter</p>
+            <p className="text-xs text-green-400 mt-1">Filter format OK</p>
           ) : null}
           <div className="flex items-center gap-3">
             <button

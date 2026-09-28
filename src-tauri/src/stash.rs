@@ -134,10 +134,10 @@ pub fn parse_query_filter(raw: &str) -> Result<QueryFilter, AppError> {
         return Ok(QueryFilter::default());
     }
     let value: Value = serde_json::from_str(raw)
-        .map_err(|e| AppError::Settings(format!("Query filter is not valid JSON: {}", e)))?;
+        .map_err(|e| AppError::Filter(format!("not valid JSON ({})", e)))?;
     let Value::Object(top) = value else {
-        return Err(AppError::Settings(
-            "Query filter must be a JSON object with `filter` and/or `image_filter`".into(),
+        return Err(AppError::Filter(
+            "must be a JSON object with filter and/or image_filter".into(),
         ));
     };
 
@@ -147,15 +147,15 @@ pub fn parse_query_filter(raw: &str) -> Result<QueryFilter, AppError> {
             "filter" => &mut parsed.filter,
             "image_filter" => &mut parsed.image_filter,
             _ => {
-                return Err(AppError::Settings(format!(
-                    "Unknown key `{}` in query filter: use `filter` and/or `image_filter`",
+                return Err(AppError::Filter(format!(
+                    "unknown key \"{}\", use filter and/or image_filter",
                     key
                 )))
             }
         };
         let Value::Object(map) = value else {
-            return Err(AppError::Settings(format!(
-                "`{}` in the query filter must be a JSON object",
+            return Err(AppError::Filter(format!(
+                "\"{}\" must be a JSON object",
                 key
             )));
         };
@@ -207,10 +207,14 @@ fn build_variables(
 }
 
 fn auth_error(status: StatusCode) -> AppError {
-    AppError::Stash(format!(
-        "Stash rejected the API key (HTTP {})",
-        status.as_u16()
-    ))
+    if status == StatusCode::FORBIDDEN {
+        AppError::Stash("access denied (HTTP 403), check the API key in Settings".into())
+    } else {
+        AppError::Stash(format!(
+            "the API key was rejected (HTTP {}), check it in Settings",
+            status.as_u16()
+        ))
+    }
 }
 
 /// Run `findImages`. GraphQL errors come back with their own message even on a
@@ -248,19 +252,20 @@ async fn find_images(
                 return Err(AppError::Stash(err.message));
             }
             if !status.is_success() {
-                return Err(AppError::Stash(format!("Stash returned HTTP {}", status)));
+                return Err(AppError::Stash(format!(
+                    "the server returned HTTP {}",
+                    status
+                )));
             }
             gql.data
                 .map(|d| d.find_images)
-                .ok_or_else(|| AppError::Stash("Stash returned no data".into()))
+                .ok_or_else(|| AppError::Stash("the server returned no data".into()))
         }
-        Err(_) if !status.is_success() => {
-            Err(AppError::Stash(format!("Stash returned HTTP {}", status)))
-        }
-        Err(e) => Err(AppError::Stash(format!(
-            "Unexpected response from Stash: {}",
-            e
+        Err(_) if !status.is_success() => Err(AppError::Stash(format!(
+            "the server returned HTTP {}",
+            status
         ))),
+        Err(e) => Err(AppError::Stash(format!("unexpected response ({})", e))),
     }
 }
 
@@ -346,7 +351,10 @@ pub async fn download_image(
         return Err(auth_error(status));
     }
     if !status.is_success() {
-        return Ok(Download::Unusable(format!("HTTP {}", status)));
+        return Ok(Download::Unusable(format!(
+            "Stash returned HTTP {} for the file",
+            status
+        )));
     }
 
     // Stash serves the file as-is, so an image clip arrives as a video. Checking
@@ -358,7 +366,7 @@ pub async fn download_image(
     {
         if !content_type.to_ascii_lowercase().starts_with("image/") {
             return Ok(Download::Unusable(format!(
-                "not an image ({})",
+                "the file is {}, not an image",
                 content_type
             )));
         }
@@ -378,12 +386,27 @@ pub async fn download_image(
         Ok(ImageFormat::Bmp) => "bmp",
         Ok(other) => {
             return Ok(Download::Unusable(format!(
-                "unsupported image format ({:?})",
+                "{:?} images aren't supported",
                 other
             )))
         }
-        Err(_) => return Ok(Download::Unusable("not a recognizable image".into())),
+        Err(_) => {
+            return Ok(Download::Unusable(
+                "the file isn't a recognizable image".into(),
+            ))
+        }
     };
+
+    // A good header can front a damaged or cut-short file, so decode it
+    let check = bytes.clone();
+    let decodes = tokio::task::spawn_blocking(move || image::load_from_memory(&check).is_ok())
+        .await
+        .unwrap_or(false);
+    if !decodes {
+        return Ok(Download::Unusable(
+            "the file is damaged or incomplete".into(),
+        ));
+    }
 
     std::fs::create_dir_all(cache_dir)?;
 
@@ -634,17 +657,17 @@ mod tests {
             // a typo in the wrapper key
             (
                 r#"{"imagefilter": {"tags": {}}}"#,
-                "Unknown key `imagefilter`",
+                "unknown key \"imagefilter\"",
             ),
             // the inner image_filter pasted without its wrapper
             (
                 r#"{"tags": {"value": ["1"], "modifier": "INCLUDES"}}"#,
-                "Unknown key `tags`",
+                "unknown key \"tags\"",
             ),
-            (r#"{"filter": []}"#, "`filter` in the query filter must be"),
+            (r#"{"filter": []}"#, "\"filter\" must be a JSON object"),
             (
                 r#"{"image_filter": null}"#,
-                "`image_filter` in the query filter must be",
+                "\"image_filter\" must be a JSON object",
             ),
         ];
         for (raw, expected) in cases {
@@ -723,6 +746,21 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_missing_content_type_falls_back_to_the_bytes() {
+            let server = MockServer::start().await;
+            serve(
+                &server,
+                "/img",
+                ResponseTemplate::new(200).set_body_bytes(png_bytes()),
+            )
+            .await;
+            let (result, _dir) = download(&server, "/img").await;
+            assert!(
+                matches!(result.unwrap(), Download::Saved(p) if p.extension().unwrap() == "png")
+            );
+        }
+
+        #[tokio::test]
         async fn sends_the_api_key() {
             let server = MockServer::start().await;
             Mock::given(method("GET"))
@@ -771,13 +809,31 @@ mod tests {
                 ResponseTemplate::new(500).set_body_string("open failed"),
             )
             .await;
+            // a JPEG header in front of garbage, and a PNG cut short
+            let mut damaged = vec![0xFF, 0xD8, 0xFF, 0xE0];
+            damaged.extend_from_slice(b"not really a jpeg at all");
+            serve(
+                &server,
+                "/damaged",
+                ResponseTemplate::new(200).set_body_raw(damaged, "image/jpeg"),
+            )
+            .await;
+            let png = png_bytes();
+            serve(
+                &server,
+                "/cut",
+                ResponseTemplate::new(200).set_body_raw(png[..png.len() / 2].to_vec(), "image/png"),
+            )
+            .await;
 
             for (at, reason) in [
-                ("/clip", "not an image (video/mp4)"),
-                ("/page", "not an image (text/html)"),
-                ("/lie", "not a recognizable image"),
+                ("/clip", "video/mp4, not an image"),
+                ("/page", "text/html, not an image"),
+                ("/lie", "isn't a recognizable image"),
                 ("/missing", "HTTP 404"),
                 ("/broken", "HTTP 500"),
+                ("/damaged", "damaged or incomplete"),
+                ("/cut", "damaged or incomplete"),
             ] {
                 let (result, dir) = download(&server, at).await;
                 match result.unwrap() {
@@ -797,7 +853,7 @@ mod tests {
             assert!(result
                 .unwrap_err()
                 .to_string()
-                .contains("rejected the API key"));
+                .contains("API key was rejected"));
         }
 
         #[tokio::test]
@@ -865,7 +921,7 @@ mod tests {
             let settings = settings_for(&server.uri(), "{}");
             let client = client_for(&settings).unwrap();
             let err = query_image_count(&client, &settings).await.unwrap_err();
-            assert!(err.to_string().contains("rejected the API key"), "{err}");
+            assert!(err.to_string().contains("API key was rejected"), "{err}");
         }
 
         #[tokio::test]
