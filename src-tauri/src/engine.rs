@@ -28,6 +28,8 @@ pub async fn run(mut rx: CommandRx, settings: Arc<RwLock<Settings>>, app_handle:
     let mut paused = false;
     let mut rotation_state = RotationState::new();
     let mut count_hint: Option<usize> = None;
+    // The file the last successful rotation put on the desktop
+    let mut current: Option<PathBuf> = None;
 
     loop {
         let interval = {
@@ -44,7 +46,7 @@ pub async fn run(mut rx: CommandRx, settings: Arc<RwLock<Settings>>, app_handle:
             cmd = rx.recv() => {
                 match cmd {
                     Some(Command::Next) => {
-                        do_rotate(&settings, &mut rotation_state, &mut count_hint, &app_handle).await;
+                        do_rotate(&settings, &mut rotation_state, &mut count_hint, &mut current, &app_handle).await;
                     }
                     Some(Command::Pause) => {
                         paused = true;
@@ -56,13 +58,13 @@ pub async fn run(mut rx: CommandRx, settings: Arc<RwLock<Settings>>, app_handle:
                         rotation_state.reset();
                         count_hint = None;
                         // Immediately rotate with new settings
-                        do_rotate(&settings, &mut rotation_state, &mut count_hint, &app_handle).await;
+                        do_rotate(&settings, &mut rotation_state, &mut count_hint, &mut current, &app_handle).await;
                     }
                     Some(Command::Quit) | None => break,
                 }
             }
             _ = tokio::time::sleep(interval), if !paused => {
-                do_rotate(&settings, &mut rotation_state, &mut count_hint, &app_handle).await;
+                do_rotate(&settings, &mut rotation_state, &mut count_hint, &mut current, &app_handle).await;
             }
         }
     }
@@ -72,10 +74,20 @@ async fn do_rotate(
     settings: &Arc<RwLock<Settings>>,
     rotation_state: &mut RotationState,
     count_hint: &mut Option<usize>,
+    current: &mut Option<PathBuf>,
     app_handle: &tauri::AppHandle,
 ) {
-    match rotate(settings, rotation_state, count_hint, app_handle).await {
-        Ok(()) => {
+    match rotate(
+        settings,
+        rotation_state,
+        count_hint,
+        current.as_deref(),
+        app_handle,
+    )
+    .await
+    {
+        Ok(path) => {
+            *current = Some(path);
             crate::update_tray_icon(app_handle, false, None);
         }
         Err(e) => {
@@ -201,6 +213,11 @@ async fn download_batch(
             .select_next(settings.rotation_mode, count)
             .ok_or_else(no_images)?;
         if !tried.insert(pick.page) {
+            if tried.len() < count {
+                // e.g. a new shuffle that starts with a page this batch already
+                // used; other pages are still untried
+                continue;
+            }
             // Every page has had its turn in this batch
             return if paths.is_empty() {
                 Err(no_usable_image(&skipped))
@@ -260,11 +277,13 @@ fn path_str(path: &Path) -> Result<&str, AppError> {
 /// Put `images` on the desktop through `set` (compositing them first for a
 /// multi-monitor layout), and only then delete older cache files. Deleting first
 /// would leave the desktop pointing at a missing file whenever a rotation fails.
-/// `set` gets the file and whether it's a spanned composite.
+/// `set` gets the file and whether it's a spanned composite. `current` is the
+/// file the last successful rotation set, if known.
 fn apply_wallpaper(
     images: &[PathBuf],
     monitors: Option<&[crate::compositor::MonitorGeometry]>,
     cache_dir: &Path,
+    current: Option<&Path>,
     set: impl FnOnce(&str, bool) -> Result<(), AppError>,
 ) -> Result<PathBuf, AppError> {
     let wallpaper_path = match monitors {
@@ -274,21 +293,37 @@ fn apply_wallpaper(
         )),
         None => images[0].clone(),
     };
-    let result = (|| {
-        if let Some(geoms) = monitors {
-            crate::compositor::composite_wallpaper(images, geoms, &wallpaper_path)?;
+    if let Some(geoms) = monitors {
+        if let Err(e) = crate::compositor::composite_wallpaper(images, geoms, &wallpaper_path) {
+            // Nothing reached the desktop
+            discard(images);
+            discard(&[wallpaper_path]);
+            return Err(e);
         }
-        set(path_str(&wallpaper_path)?, monitors.is_some())
-    })();
-    match result {
+    }
+    match set(path_str(&wallpaper_path)?, monitors.is_some()) {
         Ok(()) => {
-            stash::clean_wallpaper_cache(cache_dir, &wallpaper_path);
+            stash::clean_wallpaper_cache(cache_dir, &[&wallpaper_path]);
             Ok(wallpaper_path)
         }
         Err(e) => {
-            // The desktop still shows the old file; drop only this batch's
-            discard(images);
-            discard(&[wallpaper_path]);
+            // A setter can fail after applying the file to some monitors or
+            // workspaces, so keep it along with the last good one. Everything
+            // else goes, so repeated failures can't fill the cache. With no
+            // known good file (first rotation since start), delete nothing
+            // older: the desktop may still point at one of them.
+            match current {
+                Some(current) => {
+                    stash::clean_wallpaper_cache(cache_dir, &[&wallpaper_path, current])
+                }
+                None => discard(
+                    &images
+                        .iter()
+                        .filter(|p| **p != wallpaper_path)
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                ),
+            }
             Err(e)
         }
     }
@@ -298,8 +333,9 @@ async fn rotate(
     settings: &Arc<RwLock<Settings>>,
     rotation_state: &mut RotationState,
     count_hint: &mut Option<usize>,
+    current: Option<&Path>,
     app_handle: &tauri::AppHandle,
-) -> Result<(), AppError> {
+) -> Result<PathBuf, AppError> {
     let s = settings.read().await.clone();
     let client = stash::client_for(&s)?;
 
@@ -328,6 +364,7 @@ async fn rotate(
         &images,
         per_monitor.then_some(geoms.as_slice()),
         &cache_dir,
+        current,
         |path, spanned| {
             if spanned {
                 set_wallpaper_span(path)
@@ -335,9 +372,7 @@ async fn rotate(
                 set_wallpaper(path, &s)
             }
         },
-    )?;
-
-    Ok(())
+    )
 }
 
 fn set_wallpaper(path: &str, settings: &Settings) -> Result<(), AppError> {
@@ -668,15 +703,39 @@ mod tests {
     #[test]
     fn a_failed_set_keeps_the_current_wallpaper_file() {
         let (dir, old, new) = cache_with_old_wallpaper();
-        let result = apply_wallpaper(std::slice::from_ref(&new), None, dir.path(), |_, _| {
-            Err(AppError::Wallpaper("desktop said no".into()))
-        });
-        assert!(result.is_err());
-        assert!(old.exists(), "the file on the desktop must survive");
-        assert!(
-            !new.exists(),
-            "a batch that never reached the desktop is dropped"
+        let result = apply_wallpaper(
+            std::slice::from_ref(&new),
+            None,
+            dir.path(),
+            None,
+            |_, _| Err(AppError::Wallpaper("desktop said no".into())),
         );
+        assert!(result.is_err());
+        // with no known good file, nothing older may go: the desktop could be on it
+        assert!(old.exists(), "the file on the desktop must survive");
+        // a setter can fail after applying the file to some monitors
+        assert!(new.exists());
+    }
+
+    #[test]
+    fn repeated_failed_sets_keep_the_cache_bounded() {
+        let (dir, current, new) = cache_with_old_wallpaper();
+        let stale = dir.path().join("wallpaper_0_0.png");
+        std::fs::write(&stale, png_bytes()).unwrap();
+        let result = apply_wallpaper(
+            std::slice::from_ref(&new),
+            None,
+            dir.path(),
+            Some(&current),
+            |_, _| Err(AppError::Wallpaper("desktop said no".into())),
+        );
+        assert!(result.is_err());
+        assert!(current.exists(), "the last good file stays");
+        assert!(
+            new.exists(),
+            "the file the setter may have partly applied stays"
+        );
+        assert!(!stale.exists(), "anything else goes");
     }
 
     #[test]
@@ -687,6 +746,7 @@ mod tests {
             std::slice::from_ref(&new),
             None,
             dir.path(),
+            None,
             |p, spanned| {
                 set_to = Some((p.to_string(), spanned));
                 Ok(())
@@ -720,6 +780,7 @@ mod tests {
             &[old.clone(), new.clone()],
             Some(&monitors),
             dir.path(),
+            None,
             |_, spanned| {
                 assert!(spanned);
                 Ok(())

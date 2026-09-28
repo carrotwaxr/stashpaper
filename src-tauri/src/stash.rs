@@ -139,8 +139,8 @@ pub struct QueryFilter {
 /// exactly as written is an error, never an empty filter, because an empty filter
 /// rotates through the whole library. Only a blank filter means "no filter".
 pub fn parse_query_filter(raw: &str) -> Result<QueryFilter, AppError> {
-    // Strip a byte order mark too, as the settings window's JSON.parse does
-    let raw = raw.trim_start_matches('\u{feff}').trim();
+    // Trim a byte order mark as whitespace, as the settings window's JS trim() does
+    let raw = raw.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
     if raw.is_empty() {
         return Ok(QueryFilter::default());
     }
@@ -235,11 +235,9 @@ async fn find_images(
     settings: &Settings,
     variables: Value,
 ) -> Result<FindImagesResult, AppError> {
+    let url = format!("{}/graphql", settings.stash_url.trim_end_matches('/'));
     let resp = client
-        .post(format!(
-            "{}/graphql",
-            settings.stash_url.trim_end_matches('/')
-        ))
+        .post(&url)
         .json(&GraphQLRequest {
             query: FIND_IMAGES_QUERY.into(),
             variables,
@@ -252,12 +250,25 @@ async fn find_images(
     if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
         return Err(auth_error(status));
     }
+    // A redirect turns the POST into a GET (except for 307/308), so a failure
+    // after one is best explained as "use the address it redirects to"
+    let redirected_to = (resp.url().as_str() != url).then(|| resp.url().clone());
     let body = resp
         .text()
         .await
         .map_err(|e| AppError::Stash(e.to_string()))?;
+    match (parse_find_images(status, &body), redirected_to) {
+        (Err(_), Some(to)) => Err(AppError::Stash(format!(
+            "the server redirected to {}, use {} as the Server URL",
+            to,
+            to.origin().ascii_serialization()
+        ))),
+        (result, _) => result,
+    }
+}
 
-    match serde_json::from_str::<GraphQLResponse<FindImagesData>>(&body) {
+fn parse_find_images(status: StatusCode, body: &str) -> Result<FindImagesResult, AppError> {
+    match serde_json::from_str::<GraphQLResponse<FindImagesData>>(body) {
         Ok(gql) => {
             if let Some(err) = gql.errors.and_then(|errors| errors.into_iter().next()) {
                 return Err(AppError::Stash(err.message));
@@ -316,9 +327,9 @@ pub fn timestamp_millis() -> u128 {
         .as_millis()
 }
 
-/// Delete old wallpaper files from the cache directory, keeping `keep`: the file
-/// the desktop points at now.
-pub fn clean_wallpaper_cache(cache_dir: &Path, keep: &Path) {
+/// Delete old wallpaper files from the cache directory, except those in `keep`:
+/// the files the desktop may point at now.
+pub fn clean_wallpaper_cache(cache_dir: &Path, keep: &[&Path]) {
     let Ok(entries) = std::fs::read_dir(cache_dir) else {
         return;
     };
@@ -328,7 +339,7 @@ pub fn clean_wallpaper_cache(cache_dir: &Path, keep: &Path) {
         let name = name.to_string_lossy();
         // current_wallpaper.* is the name builds before v0.1.0 used
         let ours = name.starts_with("wallpaper_") || name.starts_with("current_wallpaper.");
-        if ours && path != keep {
+        if ours && !keep.contains(&path.as_path()) {
             let _ = std::fs::remove_file(&path);
         }
     }
@@ -410,13 +421,19 @@ pub async fn download_image(
 
     // A good header can front a damaged or cut-short file, so decode it
     let check = bytes.clone();
-    let decodes = tokio::task::spawn_blocking(move || image::load_from_memory(&check).is_ok())
+    let decoded = tokio::task::spawn_blocking(move || image::load_from_memory(&check).map(|_| ()))
         .await
-        .unwrap_or(false);
-    if !decodes {
-        return Ok(Download::Unusable(
-            "the file is damaged or incomplete".into(),
-        ));
+        .map_err(|e| AppError::Stash(e.to_string()))?;
+    match decoded {
+        Ok(()) => {}
+        Err(image::ImageError::Limits(_)) => {
+            return Ok(Download::Unusable("the image is too large to use".into()))
+        }
+        Err(_) => {
+            return Ok(Download::Unusable(
+                "the file is damaged or incomplete".into(),
+            ))
+        }
     }
 
     std::fs::create_dir_all(cache_dir)?;
@@ -711,8 +728,13 @@ mod tests {
 
     #[test]
     fn test_parse_query_filter_ignores_a_byte_order_mark() {
-        let parsed = parse_query_filter("\u{feff}{\"filter\": {\"sort\": \"rating\"}}").unwrap();
-        assert_eq!(parsed.filter["sort"], "rating");
+        for raw in [
+            "\u{feff}{\"filter\": {\"sort\": \"rating\"}}",
+            " \u{feff}{\"filter\": {\"sort\": \"rating\"}}\u{feff}\n",
+        ] {
+            let parsed = parse_query_filter(raw).unwrap();
+            assert_eq!(parsed.filter["sort"], "rating");
+        }
     }
 
     #[test]
@@ -733,7 +755,7 @@ mod tests {
         ] {
             std::fs::write(dir.path().join(name), b"x").unwrap();
         }
-        clean_wallpaper_cache(dir.path(), &dir.path().join("wallpaper_2_0.png"));
+        clean_wallpaper_cache(dir.path(), &[&dir.path().join("wallpaper_2_0.png")]);
 
         let mut left: Vec<String> = std::fs::read_dir(dir.path())
             .unwrap()
@@ -885,6 +907,27 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_huge_image_is_too_large_not_damaged() {
+            // a PNG header claiming 40000x40000 RGBA (about 6.4 GB decoded)
+            let huge: Vec<u8> = vec![
+                0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+                0x44, 0x52, 0x00, 0x00, 0x9c, 0x40, 0x00, 0x00, 0x9c, 0x40, 0x08, 0x06, 0x00, 0x00,
+                0x00, 0x51, 0x0c, 0x0e, 0x05, 0x00, 0x00, 0x00, 0x09, 0x49, 0x44, 0x41, 0x54, 0x78,
+                0x9c, 0x63, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x5e, 0xff, 0x7d, 0xf9, 0x00, 0x00,
+                0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+            ];
+            let server = MockServer::start().await;
+            serve(
+                &server,
+                "/huge",
+                ResponseTemplate::new(200).set_body_raw(huge, "image/png"),
+            )
+            .await;
+            let (result, _dir) = download(&server, "/huge").await;
+            assert!(matches!(result.unwrap(), Download::Unusable(r) if r.contains("too large")));
+        }
+
+        #[tokio::test]
         async fn a_rejected_key_fails_the_rotation() {
             let server = MockServer::start().await;
             serve(&server, "/img", ResponseTemplate::new(401)).await;
@@ -948,6 +991,34 @@ mod tests {
             let client = client_for(&settings).unwrap();
             let err = query_image_count(&client, &settings).await.unwrap_err();
             assert!(err.to_string().contains("unknown field tagz"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn find_images_explains_a_redirect_it_cannot_follow() {
+            let server = MockServer::start().await;
+            // a 301 turns the POST into an empty GET, which Stash rejects
+            Mock::given(method("POST"))
+                .and(path("/graphql"))
+                .respond_with(
+                    ResponseTemplate::new(301).insert_header("Location", "/stash/graphql"),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/stash/graphql"))
+                .respond_with(ResponseTemplate::new(422).set_body_json(serde_json::json!({
+                    "errors": [{"message": "no operation provided"}], "data": null
+                })))
+                .mount(&server)
+                .await;
+            let settings = settings_for(&server.uri(), "{}");
+            let client = client_for(&settings).unwrap();
+            let err = query_image_count(&client, &settings)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("redirected to"), "{err}");
+            assert!(err.contains("as the Server URL"), "{err}");
         }
 
         #[tokio::test]
