@@ -61,6 +61,18 @@ query FindImages($filter: FindFilterType, $image_filter: ImageFilterType) {
 }
 "#;
 
+/// Whether a redirect keeps the ApiKey header on the same server: the same host
+/// and port, or the same host upgraded from http to https (common behind a
+/// reverse proxy). Anything else could hand the key to another service.
+fn redirect_allowed(from: &reqwest::Url, to: &reqwest::Url) -> bool {
+    if from.host_str() != to.host_str() {
+        return false;
+    }
+    let same_port = from.port_or_known_default() == to.port_or_known_default();
+    let upgrade = from.scheme() == "http" && to.scheme() == "https" && to.port().is_none();
+    (same_port && from.scheme() == to.scheme()) || upgrade
+}
+
 fn build_client(api_key: &str) -> Result<Client, AppError> {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
@@ -71,14 +83,12 @@ fn build_client(api_key: &str) -> Result<Client, AppError> {
             .map_err(|e: reqwest::header::InvalidHeaderValue| AppError::Stash(e.to_string()))?,
     );
 
-    // Follow redirects only within the same origin, so the ApiKey header never
-    // goes to another host.
     let redirects = reqwest::redirect::Policy::custom(|attempt| {
-        let same_origin = attempt
+        let allowed = attempt
             .previous()
             .last()
-            .is_some_and(|prev| prev.origin() == attempt.url().origin());
-        if !same_origin {
+            .is_some_and(|prev| redirect_allowed(prev, attempt.url()));
+        if !allowed {
             attempt.stop()
         } else if attempt.previous().len() > 5 {
             attempt.error("too many redirects")
@@ -129,7 +139,8 @@ pub struct QueryFilter {
 /// exactly as written is an error, never an empty filter, because an empty filter
 /// rotates through the whole library. Only a blank filter means "no filter".
 pub fn parse_query_filter(raw: &str) -> Result<QueryFilter, AppError> {
-    let raw = raw.trim();
+    // Strip a byte order mark too, as the settings window's JSON.parse does
+    let raw = raw.trim_start_matches('\u{feff}').trim();
     if raw.is_empty() {
         return Ok(QueryFilter::default());
     }
@@ -674,6 +685,34 @@ mod tests {
             let err = parse_query_filter(raw).unwrap_err().to_string();
             assert!(err.contains(expected), "{raw}: got {err}");
         }
+    }
+
+    #[test]
+    fn test_redirects_stay_on_the_stash_server() {
+        let url = |s: &str| reqwest::Url::parse(s).unwrap();
+        let allowed = [
+            ("http://stash:9999/graphql", "http://stash:9999/other"),
+            ("http://stash.lan/graphql", "https://stash.lan/graphql"),
+            ("https://stash.lan/a", "https://stash.lan:443/b"),
+        ];
+        let refused = [
+            ("http://stash:9999/a", "http://evil:9999/a"),
+            ("http://stash:9999/a", "http://stash:8080/a"),
+            ("https://stash.lan/a", "http://stash.lan/a"),
+            ("http://stash.lan/a", "https://stash.lan:8443/a"),
+        ];
+        for (from, to) in allowed {
+            assert!(redirect_allowed(&url(from), &url(to)), "{from} -> {to}");
+        }
+        for (from, to) in refused {
+            assert!(!redirect_allowed(&url(from), &url(to)), "{from} -> {to}");
+        }
+    }
+
+    #[test]
+    fn test_parse_query_filter_ignores_a_byte_order_mark() {
+        let parsed = parse_query_filter("\u{feff}{\"filter\": {\"sort\": \"rating\"}}").unwrap();
+        assert_eq!(parsed.filter["sort"], "rating");
     }
 
     #[test]

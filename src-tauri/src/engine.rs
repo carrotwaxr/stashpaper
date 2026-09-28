@@ -147,6 +147,14 @@ fn set_mode_or_log(mode: wallpaper::Mode) {
 /// How many unusable images a rotation skips before giving up.
 const MAX_SKIPS: usize = 5;
 
+/// Delete files a failed rotation downloaded. They never reached the desktop, and
+/// nothing else would clean them up while rotations keep failing.
+fn discard(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 fn no_images() -> AppError {
     AppError::Stash("no images match the query filter and minimum resolution".into())
 }
@@ -201,17 +209,34 @@ async fn download_batch(
             };
         }
         let (fresh_count, image) =
-            stash::fetch_image_at_page(client, settings, pick.page, pick.random_seed).await?;
-        let outcome = match image.and_then(|image| image.paths.image) {
-            Some(url) => stash::download_image(client, &url, cache_dir, paths.len()).await?,
-            // The library shrank since the count, or the image has no file
-            None => stash::Download::Unusable("the library changed while picking".into()),
-        };
+            match stash::fetch_image_at_page(client, settings, pick.page, pick.random_seed).await {
+                Ok(result) => result,
+                Err(e) => {
+                    discard(&paths);
+                    return Err(e);
+                }
+            };
         count = fresh_count;
+        *count_hint = Some(count);
         if count == 0 {
             *count_hint = None;
+            discard(&paths);
             return Err(no_images());
         }
+        let outcome = match image.and_then(|image| image.paths.image) {
+            Some(url) => match stash::download_image(client, &url, cache_dir, paths.len()).await {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    discard(&paths);
+                    return Err(e);
+                }
+            },
+            // The page is past the end of a library that shrank since the last
+            // count. Not the image's fault, so it doesn't use up a skip; the
+            // next pick uses the fresh count.
+            None if pick.page > count => continue,
+            None => stash::Download::Unusable("the image has no file".into()),
+        };
 
         match outcome {
             stash::Download::Saved(path) => paths.push(path),
@@ -219,6 +244,7 @@ async fn download_batch(
                 eprintln!("[StashPaper] Skipping image: {}", reason);
                 skipped.push(reason);
                 if skipped.len() >= MAX_SKIPS.min(count) {
+                    discard(&paths);
                     return Err(no_usable_image(&skipped));
                 }
             }
@@ -242,19 +268,30 @@ fn apply_wallpaper(
     set: impl FnOnce(&str, bool) -> Result<(), AppError>,
 ) -> Result<PathBuf, AppError> {
     let wallpaper_path = match monitors {
-        Some(geoms) => {
-            let composite_path = cache_dir.join(format!(
-                "wallpaper_composite_{}.jpg",
-                stash::timestamp_millis()
-            ));
-            crate::compositor::composite_wallpaper(images, geoms, &composite_path)?;
-            composite_path
-        }
+        Some(_) => cache_dir.join(format!(
+            "wallpaper_composite_{}.jpg",
+            stash::timestamp_millis()
+        )),
         None => images[0].clone(),
     };
-    set(path_str(&wallpaper_path)?, monitors.is_some())?;
-    stash::clean_wallpaper_cache(cache_dir, &wallpaper_path);
-    Ok(wallpaper_path)
+    let result = (|| {
+        if let Some(geoms) = monitors {
+            crate::compositor::composite_wallpaper(images, geoms, &wallpaper_path)?;
+        }
+        set(path_str(&wallpaper_path)?, monitors.is_some())
+    })();
+    match result {
+        Ok(()) => {
+            stash::clean_wallpaper_cache(cache_dir, &wallpaper_path);
+            Ok(wallpaper_path)
+        }
+        Err(e) => {
+            // The desktop still shows the old file; drop only this batch's
+            discard(images);
+            discard(&[wallpaper_path]);
+            Err(e)
+        }
+    }
 }
 
 async fn rotate(
@@ -534,6 +571,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_library_that_shrank_is_noticed_in_the_same_rotation() {
+        let server = stash_with_files().await;
+        let empty = ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"findImages": {"count": 1, "images": []}}
+        }));
+        // the hint says 10, but the filter now matches 1 image
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(page_query(4))
+            .respond_with(empty)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(page_query(1))
+            .respond_with(page(&server, 1, "/good"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let settings = settings_for(&server);
+        let client = stash::client_for(&settings).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut rotation = RotationState::new();
+        for _ in 0..3 {
+            rotation.select_next(settings.rotation_mode, 10);
+        }
+        let mut count_hint = Some(10);
+        let paths = download_batch(
+            &client,
+            &settings,
+            &mut rotation,
+            &mut count_hint,
+            1,
+            dir.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(count_hint, Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_failed_batch_leaves_no_files_behind() {
+        let server = stash_with_files().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(page_query(1))
+            .respond_with(page(&server, 50, "/good"))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(page(&server, 50, "/clip"))
+            .mount(&server)
+            .await;
+
+        // page 1 downloads, then five clips end the batch
+        let (result, dir) = run_batch(&server, &mut Some(50), 2).await;
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
     async fn an_empty_library_is_an_error_and_forgets_the_count() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -570,7 +673,10 @@ mod tests {
         });
         assert!(result.is_err());
         assert!(old.exists(), "the file on the desktop must survive");
-        assert!(new.exists());
+        assert!(
+            !new.exists(),
+            "a batch that never reached the desktop is dropped"
+        );
     }
 
     #[test]

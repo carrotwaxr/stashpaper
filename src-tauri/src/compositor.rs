@@ -1,6 +1,7 @@
 use crate::error::AppError;
 use image::codecs::jpeg::JpegEncoder;
 use image::{DynamicImage, GenericImageView, RgbImage};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -96,13 +97,13 @@ pub fn composite_wallpaper(
         image::imageops::overlay(&mut canvas, &filled, canvas_x as i64, canvas_y as i64);
     }
 
-    let file = std::fs::File::create(output_path)?;
+    // Flush explicitly: BufWriter's drop swallows errors, and a cut-short
+    // composite must not reach the desktop
+    let mut writer = std::io::BufWriter::new(std::fs::File::create(output_path)?);
     canvas
-        .write_with_encoder(JpegEncoder::new_with_quality(
-            std::io::BufWriter::new(file),
-            90,
-        ))
+        .write_with_encoder(JpegEncoder::new_with_quality(&mut writer, 90))
         .map_err(|e| AppError::Wallpaper(format!("Failed to save composite: {}", e)))?;
+    writer.flush()?;
 
     Ok(())
 }
