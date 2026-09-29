@@ -526,12 +526,26 @@ pub async fn download_image(
     };
 
     // A good header can front a damaged or cut-short file, so decode it
+    // A good header can front a damaged or cut-short file, so decode it. The
+    // decode also converts what some desktops can't read (WebP without a
+    // gdk-pixbuf loader, WebP on older Windows, GIF, BMP) to PNG: swaybg and
+    // GNOME show black rather than fail on an image they can't load.
     let check = bytes.clone();
-    let decoded = tokio::task::spawn_blocking(move || image::load_from_memory(&check).map(|_| ()))
-        .await
-        .map_err(|e| AppError::Stash(e.to_string()))?;
-    match decoded {
-        Ok(()) => {}
+    let keep_as_is = matches!(ext, "jpg" | "png");
+    let decoded = tokio::task::spawn_blocking(move || {
+        let image = image::load_from_memory(&check)?;
+        if keep_as_is {
+            return Ok(None);
+        }
+        let mut png = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut png, ImageFormat::Png)?;
+        Ok(Some(png.into_inner()))
+    })
+    .await
+    .map_err(|e| AppError::Stash(e.to_string()))?;
+    let (bytes, ext) = match decoded {
+        Ok(None) => (bytes.to_vec(), ext),
+        Ok(Some(png)) => (png, "png"),
         Err(image::ImageError::Limits(_)) => {
             return Ok(Download::Unusable("the image is too large to use".into()))
         }
@@ -540,7 +554,7 @@ pub async fn download_image(
                 "the file is damaged or incomplete".into(),
             ))
         }
-    }
+    };
 
     tokio::fs::create_dir_all(cache_dir).await?;
 
@@ -1046,6 +1060,27 @@ mod tests {
                 .to_string()
                 .to_lowercase();
             assert!(err.contains("refused"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn webp_is_converted_to_png_for_desktops_that_cant_read_it() {
+            let img = image::RgbImage::from_pixel(4, 4, image::Rgb([200, 30, 30]));
+            let mut webp = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut webp, ImageFormat::WebP).unwrap();
+            let server = MockServer::start().await;
+            serve(
+                &server,
+                "/img",
+                ResponseTemplate::new(200).set_body_raw(webp.into_inner(), "image/webp"),
+            )
+            .await;
+            let (result, _dir) = download(&server, "/img").await;
+            let Download::Saved(path) = result.unwrap() else {
+                panic!("expected Saved");
+            };
+            assert_eq!(path.extension().unwrap(), "png");
+            let bytes = std::fs::read(&path).unwrap();
+            assert_eq!(image::guess_format(&bytes).unwrap(), ImageFormat::Png);
         }
 
         #[tokio::test]

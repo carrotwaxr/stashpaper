@@ -196,15 +196,17 @@ impl Desktop {
     }
 
     fn set_with_feh(&self, path: &Path, fit: FitMode) -> Result<(), AppError> {
-        let mode = match fit {
-            FitMode::Center => "--bg-center",
-            FitMode::Crop | FitMode::Span => "--bg-fill",
-            FitMode::Fit => "--bg-max",
-            FitMode::Stretch => "--bg-scale",
-            FitMode::Tile => "--bg-tile",
+        let mode: &[&str] = match fit {
+            FitMode::Center => &["--bg-center"],
+            FitMode::Crop => &["--bg-fill"],
+            // One picture across all screens rather than one per screen
+            FitMode::Span => &["--no-xinerama", "--bg-fill"],
+            FitMode::Fit => &["--bg-max"],
+            FitMode::Stretch => &["--bg-scale"],
+            FitMode::Tile => &["--bg-tile"],
         };
         let status = std::process::Command::new(&self.program)
-            .arg(mode)
+            .args(mode)
             .arg(path)
             .status()
             .map_err(|e| {
@@ -408,34 +410,34 @@ mod windows {
     pub fn set_all(path: &Path, fit: FitMode) -> Result<(), AppError> {
         let _com = Com::init()?;
         let dw = desktop_wallpaper()?;
-        unsafe { dw.SetPosition(position(fit)) }.map_err(err)?;
-        // A null monitor id means every monitor
-        unsafe { dw.SetWallpaper(PCWSTR::null(), &HSTRING::from(path.as_os_str())) }.map_err(err)
+        // A null monitor id means every monitor. The position goes second, so a
+        // failed set leaves the old wallpaper shown as it was
+        unsafe { dw.SetWallpaper(PCWSTR::null(), &HSTRING::from(path.as_os_str())) }
+            .map_err(err)?;
+        unsafe { dw.SetPosition(position(fit)) }.map_err(err)
     }
 
     pub fn set_each(images: &[(MonitorInfo, PathBuf)]) -> Result<(), AppError> {
         let _com = Com::init()?;
         let dw = desktop_wallpaper()?;
-        // Before the images: a position of Span would join them into one
-        unsafe { dw.SetPosition(DWPOS_FILL) }.map_err(err)?;
         let system = monitors(&dw)?;
+        // Every attached monitor gets an image: matched ones theirs, one plugged
+        // in since the images were picked the last. So nothing on screen keeps
+        // a file cleanup is about to delete. No monitors at all is a failure.
         let pairs = match_monitors(images, &system);
-        // Reporting success here would let cleanup delete files still on screen
-        if pairs.is_empty() || pairs.len() < images.len().min(system.len()) {
-            return Err(AppError::Wallpaper(format!(
-                "Windows reported {} monitor(s) and only {} matched",
-                system.len(),
-                pairs.len()
-            )));
+        if pairs.is_empty() {
+            return Err(AppError::Wallpaper(
+                "Windows reported no attached monitors".into(),
+            ));
         }
-        // A monitor plugged in since the images were picked gets the last one,
-        // rather than keep a file cleanup is about to delete
         let last = images.last().map(|(_, path)| path.as_path());
         let leftover: Vec<(String, &Path)> = system
             .iter()
             .filter(|(id, _)| !pairs.iter().any(|(matched, _)| matched == id))
             .filter_map(|(id, _)| last.map(|path| (id.clone(), path)))
             .collect();
+        // Fill before the images: a position of Span would join them into one
+        unsafe { dw.SetPosition(DWPOS_FILL) }.map_err(err)?;
         for (id, path) in pairs.into_iter().chain(leftover) {
             unsafe {
                 dw.SetWallpaper(
@@ -691,6 +693,17 @@ mod tests {
         use super::*;
         use std::os::unix::fs::PermissionsExt;
 
+        /// These tests write scripts and run them. Run one at a time: a script
+        /// written while another thread forks can't be executed for a moment
+        /// ("Text file busy"), because the fork briefly holds it open.
+        static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+            ONE_AT_A_TIME
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
         /// An executable script standing in for swaybg or feh.
         fn fake(dir: &Path, name: &str, body: &str) -> PathBuf {
             let path = dir.join(name);
@@ -726,6 +739,7 @@ mod tests {
 
         #[test]
         fn swaybg_keeps_one_process_and_records_it() {
+            let _serial = one_at_a_time();
             let dir = tempfile::tempdir().unwrap();
             let mut desktop = swaybg(dir.path(), fake(dir.path(), "swaybg", "sleep 30"));
             let image = dir.path().join("wallpaper.jpg");
@@ -749,6 +763,7 @@ mod tests {
 
         #[test]
         fn a_failing_swaybg_leaves_the_old_one_up() {
+            let _serial = one_at_a_time();
             let dir = tempfile::tempdir().unwrap();
             let mut desktop = swaybg(dir.path(), fake(dir.path(), "swaybg", "sleep 30"));
             let image = dir.path().join("wallpaper.jpg");
@@ -770,6 +785,7 @@ mod tests {
 
         #[test]
         fn a_missing_tool_says_what_to_install() {
+            let _serial = one_at_a_time();
             let dir = tempfile::tempdir().unwrap();
             let image = dir.path().join("wallpaper.jpg");
             let mut desktop = swaybg(dir.path(), dir.path().join("no-such-swaybg"));
@@ -795,6 +811,7 @@ mod tests {
 
         #[test]
         fn feh_gets_the_fit_mode() {
+            let _serial = one_at_a_time();
             let dir = tempfile::tempdir().unwrap();
             let args = dir.path().join("args");
             let program = fake(
@@ -812,10 +829,18 @@ mod tests {
             feh.apply(Placement::Single(&image), FitMode::Fit).unwrap();
             let got = std::fs::read_to_string(&args).unwrap();
             assert_eq!(got.trim(), format!("--bg-max {}", image.display()));
+
+            feh.apply(Placement::Single(&image), FitMode::Span).unwrap();
+            let got = std::fs::read_to_string(&args).unwrap();
+            assert_eq!(
+                got.trim(),
+                format!("--no-xinerama --bg-fill {}", image.display())
+            );
         }
 
         #[test]
         fn a_leftover_swaybg_from_a_previous_run_is_stopped_but_nothing_else() {
+            let _serial = one_at_a_time();
             let dir = tempfile::tempdir().unwrap();
             let program = fake(dir.path(), "swaybg", "sleep 30");
             let image = dir.path().join("wallpaper.jpg");
