@@ -8,8 +8,9 @@ System tray app that rotates desktop wallpapers from a Stash server's images: a 
 - Lint: `cd src-tauri && cargo fmt --check && cargo clippy --all-targets -- -D warnings`, then `npx tsc --noEmit`
 - Build: `npm run build` (frontend), `cargo tauri build` (bundles)
 - Audit: `cd src-tauri && cargo audit`
+- Smoke: `scripts/smoke.sh <binary>` launches the app with an empty profile (Linux: under `xvfb-run -a dbus-run-session --`)
 
-Run them all before committing. CI runs tests, clippy and the frontend build on Linux, Windows and macOS, fmt, tsc and a version check on Linux, and audits in a separate scheduled workflow. `cargo tauri build` runs only for release tags.
+Run them all before committing. CI runs tests, clippy and the frontend build on Linux, Windows and macOS, fmt, tsc, a version check and the smoke launch on Linux, and audits in a separate scheduled workflow. `cargo tauri build` runs only for release tags.
 
 ## Conventions that differ from defaults
 - The version lives in `src-tauri/Cargo.toml` and `package.json` only; `tauri.conf.json` has none on purpose. CI fails when the two differ.

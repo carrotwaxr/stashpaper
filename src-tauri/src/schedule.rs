@@ -103,10 +103,13 @@ pub fn state_path(data_dir: &Path) -> PathBuf {
 
 /// Load saved state. A missing or unreadable file means a fresh start.
 pub fn load(path: &Path) -> SavedState {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|contents| serde_json::from_str(&contents).ok())
-        .unwrap_or_default()
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return SavedState::default();
+    };
+    serde_json::from_str(&contents).unwrap_or_else(|e| {
+        log::warn!("Ignoring unreadable {}: {}", path.display(), e);
+        SavedState::default()
+    })
 }
 
 /// Save state atomically: write a temp file, then rename it over the old one.

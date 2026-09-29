@@ -44,7 +44,9 @@ fn show_settings_window(app: &tauri::AppHandle) {
 fn send_to_engine(tx: &engine::CommandTx, command: engine::Command) {
     let tx = tx.clone();
     tauri::async_runtime::spawn(async move {
-        let _ = tx.send(command).await;
+        if let Err(e) = tx.send(command).await {
+            log::error!("The rotation engine isn't running: {}", e);
+        }
     });
 }
 
@@ -201,6 +203,8 @@ pub fn run() {
             set_autostart,
         ])
         .setup(|app| {
+            log::info!("StashPaper {} starting", app.package_info().version);
+
             // Load settings
             let loaded = settings::load(app.handle())?;
             let first_run = !settings::is_configured(&loaded);
@@ -239,9 +243,11 @@ pub fn run() {
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(move |app, event| match event.id.as_ref() {
-                    tray::NEXT => send_to_engine(&tray_tx, engine::Command::Next),
-                    tray::PAUSE => send_to_engine(&tray_tx, engine::Command::Pause),
-                    tray::RESUME => send_to_engine(&tray_tx, engine::Command::Resume),
+                    id if tray::command_for(id).is_some() => {
+                        if let Some(command) = tray::command_for(id) {
+                            send_to_engine(&tray_tx, command);
+                        }
+                    }
                     tray::SETTINGS => show_settings_window(app),
                     tray::LOGS => {
                         let opened = app
@@ -299,8 +305,15 @@ pub fn run() {
             // Start rotation engine
             let engine_settings = shared_settings.clone();
             let engine_handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
+            let engine_task = tauri::async_runtime::spawn(async move {
                 engine::run(rx, engine_settings, engine_handle).await;
+            });
+            // A panic in the engine would otherwise only reach stderr, and the
+            // tray would silently stop responding
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = engine_task.await {
+                    log::error!("The rotation engine stopped unexpectedly: {}", e);
+                }
             });
 
             Ok(())

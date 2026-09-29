@@ -126,70 +126,119 @@ fn tooltip(status: &TrayStatus, now: SystemTime) -> String {
     truncate(&format!("StashPaper - {}", text), 250)
 }
 
-pub fn build_menu(app: &AppHandle, status: &TrayStatus) -> tauri::Result<Menu<tauri::Wry>> {
-    let now = SystemTime::now();
-    let status_item =
-        MenuItem::with_id(app, "status", status_line(status, now), false, None::<&str>)?;
-    let next = MenuItem::with_id(app, NEXT, "Next Wallpaper", status.configured, None::<&str>)?;
-    let pause = if status.paused {
-        MenuItem::with_id(app, RESUME, "Resume", true, None::<&str>)?
-    } else {
-        MenuItem::with_id(app, PAUSE, "Pause", status.configured, None::<&str>)?
-    };
-    let menu = Menu::with_items(
-        app,
-        &[
-            &status_item,
-            &PredefinedMenuItem::separator(app)?,
-            &next,
-            &pause,
-        ],
-    )?;
+/// One line of the tray menu.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Entry {
+    Item {
+        id: String,
+        label: String,
+        enabled: bool,
+    },
+    Separator,
+    Submenu {
+        label: String,
+        items: Vec<Entry>,
+    },
+}
 
+fn item(id: &str, label: &str, enabled: bool) -> Entry {
+    Entry::Item {
+        id: id.into(),
+        label: label.into(),
+        enabled,
+    }
+}
+
+/// The tray menu for `status`, as data.
+pub fn menu_entries(status: &TrayStatus, now: SystemTime) -> Vec<Entry> {
+    let mut entries = vec![
+        item("status", &status_line(status, now), false),
+        Entry::Separator,
+        item(NEXT, "Next Wallpaper", status.configured),
+        if status.paused {
+            item(RESUME, "Resume", true)
+        } else {
+            item(PAUSE, "Pause", status.configured)
+        },
+    ];
     match status.open.as_slice() {
         [] => {}
-        [_] => menu.append(&MenuItem::with_id(
+        [_] => entries.push(item(&format!("{}0", OPEN_PREFIX), "Open in Stash", true)),
+        images => entries.push(Entry::Submenu {
+            label: "Open in Stash".into(),
+            items: images
+                .iter()
+                .enumerate()
+                .map(|(index, image)| {
+                    item(&format!("{}{}", OPEN_PREFIX, index), &image.label, true)
+                })
+                .collect(),
+        }),
+    }
+    entries.push(Entry::Separator);
+    if status.error.is_some() {
+        entries.push(item(LOGS, "Open Log Folder", true));
+    }
+    entries.push(item(SETTINGS, "Settings", true));
+    entries.push(item(QUIT, "Quit", true));
+    entries
+}
+
+/// The engine command behind a menu item, if it's one of those.
+pub fn command_for(menu_id: &str) -> Option<crate::engine::Command> {
+    use crate::engine::Command;
+    match menu_id {
+        NEXT => Some(Command::Next),
+        PAUSE => Some(Command::Pause),
+        RESUME => Some(Command::Resume),
+        _ => None,
+    }
+}
+
+fn menu_item(app: &AppHandle, entry: &Entry) -> tauri::Result<Option<MenuItem<tauri::Wry>>> {
+    Ok(match entry {
+        Entry::Item { id, label, enabled } => Some(MenuItem::with_id(
             app,
-            format!("{}0", OPEN_PREFIX),
-            "Open in Stash",
-            true,
+            id.as_str(),
+            label,
+            *enabled,
             None::<&str>,
-        )?)?,
-        items => {
-            let submenu = Submenu::with_id(app, "open", "Open in Stash", true)?;
-            for (index, item) in items.iter().enumerate() {
-                submenu.append(&MenuItem::with_id(
-                    app,
-                    format!("{}{}", OPEN_PREFIX, index),
-                    &item.label,
-                    true,
-                    None::<&str>,
-                )?)?;
+        )?),
+        _ => None,
+    })
+}
+
+pub fn build_menu(app: &AppHandle, status: &TrayStatus) -> tauri::Result<Menu<tauri::Wry>> {
+    let menu = Menu::new(app)?;
+    for entry in menu_entries(status, SystemTime::now()) {
+        match &entry {
+            Entry::Item { .. } => {
+                if let Some(item) = menu_item(app, &entry)? {
+                    menu.append(&item)?;
+                }
             }
-            menu.append(&submenu)?;
+            Entry::Separator => menu.append(&PredefinedMenuItem::separator(app)?)?,
+            // The menu has one level of submenu, of plain items
+            Entry::Submenu { label, items } => {
+                let submenu = Submenu::with_id(app, "open", label, true)?;
+                for child in items {
+                    if let Some(item) = menu_item(app, child)? {
+                        submenu.append(&item)?;
+                    }
+                }
+                menu.append(&submenu)?;
+            }
         }
     }
-
-    menu.append(&PredefinedMenuItem::separator(app)?)?;
-    if status.error.is_some() {
-        menu.append(&MenuItem::with_id(
-            app,
-            LOGS,
-            "Open Log Folder",
-            true,
-            None::<&str>,
-        )?)?;
-    }
-    menu.append_items(&[
-        &MenuItem::with_id(app, SETTINGS, "Settings", true, None::<&str>)?,
-        &MenuItem::with_id(app, QUIT, "Quit", true, None::<&str>)?,
-    ])?;
     Ok(menu)
 }
 
 /// Bring the tray's menu, icon and tooltip in line with `status`.
 pub fn refresh(app: &AppHandle, status: &TrayStatus) {
-    *app.state::<OpenUrls>().0.lock().unwrap() =
+    *app.state::<OpenUrls>()
+        .0
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
         status.open.iter().map(|item| item.url.clone()).collect();
 
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
@@ -337,5 +386,92 @@ mod tests {
             ..configured()
         };
         assert!(tooltip(&huge, SystemTime::now()).chars().count() <= 250);
+    }
+
+    fn ids(entries: &[Entry]) -> Vec<String> {
+        entries
+            .iter()
+            .flat_map(|entry| match entry {
+                Entry::Item { id, .. } => vec![id.clone()],
+                Entry::Separator => vec![],
+                Entry::Submenu { items, .. } => ids(items),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pause_turns_into_resume_and_each_sends_its_command() {
+        let now = SystemTime::now();
+        let running = configured();
+        let paused = TrayStatus {
+            paused: true,
+            ..configured()
+        };
+        assert!(ids(&menu_entries(&running, now)).contains(&PAUSE.to_string()));
+        assert!(!ids(&menu_entries(&running, now)).contains(&RESUME.to_string()));
+        assert!(ids(&menu_entries(&paused, now)).contains(&RESUME.to_string()));
+        assert!(!ids(&menu_entries(&paused, now)).contains(&PAUSE.to_string()));
+
+        use crate::engine::Command;
+        assert_eq!(command_for(PAUSE), Some(Command::Pause));
+        assert_eq!(command_for(RESUME), Some(Command::Resume));
+        assert_eq!(command_for(NEXT), Some(Command::Next));
+        assert_eq!(command_for("open:0"), None);
+    }
+
+    #[test]
+    fn open_in_stash_is_one_item_or_one_per_monitor() {
+        let now = SystemTime::now();
+        let one = TrayStatus {
+            open: vec![OpenItem {
+                label: String::new(),
+                url: "http://stash/images/1".into(),
+            }],
+            ..configured()
+        };
+        assert!(menu_entries(&one, now).contains(&item("open:0", "Open in Stash", true)));
+
+        let two = TrayStatus {
+            open: vec![
+                OpenItem {
+                    label: "Monitor 1 (1920x1080)".into(),
+                    url: "http://stash/images/1".into(),
+                },
+                OpenItem {
+                    label: "Monitor 2 (2560x1440)".into(),
+                    url: "http://stash/images/2".into(),
+                },
+            ],
+            ..configured()
+        };
+        let submenu = menu_entries(&two, now)
+            .into_iter()
+            .find(|e| matches!(e, Entry::Submenu { .. }))
+            .expect("a submenu");
+        assert_eq!(
+            submenu,
+            Entry::Submenu {
+                label: "Open in Stash".into(),
+                items: vec![
+                    item("open:0", "Monitor 1 (1920x1080)", true),
+                    item("open:1", "Monitor 2 (2560x1440)", true),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn not_set_up_disables_next_and_pause_and_errors_offer_the_log() {
+        let now = SystemTime::now();
+        let entries = menu_entries(&TrayStatus::default(), now);
+        assert!(entries.contains(&item(NEXT, "Next Wallpaper", false)));
+        assert!(entries.contains(&item(PAUSE, "Pause", false)));
+        assert!(!ids(&entries).contains(&LOGS.to_string()));
+
+        let failing = TrayStatus {
+            error: Some("Stash error: down".into()),
+            ..configured()
+        };
+        assert!(ids(&menu_entries(&failing, now)).contains(&LOGS.to_string()));
     }
 }
