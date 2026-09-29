@@ -10,13 +10,27 @@ Built with [Tauri v2](https://v2.tauri.app/) (Rust backend) and React.
 - **Rotation modes**: Random (seeded, no repeats), Sequential, Shuffle
 - **Query filtering**: Full control over which images are selected using Stash's GraphQL filter syntax
 - **Minimum resolution filtering**: Only use images above 720p, 1080p, 1440p, or 4K
-- **Per-monitor wallpapers**: A different image on each monitor, stitched into one spanned wallpaper (tested on GNOME)
+- **Per-monitor wallpapers**: A different image on each monitor (see the desktop support table)
 - **Test query**: Preview how many images match your filter before saving
 - **System tray**: a status line (last change, paused, or the current error), Next wallpaper, Pause/Resume, Open in Stash, Settings, Quit
 - **Error indication**: Tray icon gets a red tint on errors, and the status line says what went wrong and when it retries
 - **Keeps time across sleep and restarts**: the interval counts wall-clock time, so a daily wallpaper changes daily even on a laptop that sleeps; after a failure it retries within minutes
 - **Start at login**: one checkbox in Settings
 - **Cross-platform**: Linux, Windows, macOS
+
+## Desktop support
+
+| Desktop | Wallpaper | Per-monitor | Tested |
+|---------|-----------|-------------|--------|
+| GNOME, Ubuntu, Pantheon | yes | one composite image spanned across monitors | yes (X11) |
+| Cinnamon, MATE, Deepin | yes | spanned composite | no |
+| Windows 10/11 | yes | native: one image per monitor, always cropped to fill it | CI only for now |
+| KDE Plasma, XFCE, LXDE | yes | no, every monitor gets the same image | no |
+| sway, Hyprland and other Wayland compositors with wlr-layer-shell | yes, needs `swaybg` installed | no, every monitor gets the same image | no |
+| Other X11 window managers (i3, bspwm, ...) | yes, needs `feh` installed | no, every monitor gets the same image | no |
+| macOS | yes (Fit Mode isn't applied) | no | no |
+
+"Spanned" desktops can't take a separate image per monitor, so StashPaper crops each image to its monitor and joins them into one picture. On setups where monitors use different scale factors (mixed-DPI Wayland), that picture may not line up with the monitors.
 
 ## Install
 

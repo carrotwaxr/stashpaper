@@ -54,8 +54,11 @@ pub struct SavedState {
     /// `selection_key` of the settings the position below belongs to
     pub selection_key: String,
     pub rotation: RotationSnapshot,
-    /// The file on the desktop, so a failed rotation after a restart knows
-    /// which cache file it must not delete
+    /// The files on the desktop (one per monitor on Windows), so a failed
+    /// rotation after a restart knows which cache files it must not delete
+    pub current_files: Vec<PathBuf>,
+    /// The single-file form of `current_files` that 0.3 saved; read only
+    #[serde(skip_serializing)]
     pub current_wallpaper: Option<PathBuf>,
     /// The images on the desktop, for "Open in Stash" after a restart
     pub shown: Vec<ShownImage>,
@@ -75,6 +78,14 @@ pub struct ShownImage {
 }
 
 impl SavedState {
+    pub fn on_desktop(&self) -> Vec<PathBuf> {
+        if self.current_files.is_empty() {
+            self.current_wallpaper.iter().cloned().collect()
+        } else {
+            self.current_files.clone()
+        }
+    }
+
     pub fn last_rotated_time(&self) -> Option<SystemTime> {
         self.last_rotated
             .map(|secs| UNIX_EPOCH + Duration::from_secs(secs))
@@ -239,7 +250,8 @@ mod tests {
                 random_page: 3,
                 sort_seed: 99,
             },
-            current_wallpaper: Some(PathBuf::from("/cache/wallpaper_1_0.jpg")),
+            current_files: vec![PathBuf::from("/cache/wallpaper_1_0.jpg")],
+            current_wallpaper: None,
             shown: vec![ShownImage {
                 id: "12".into(),
                 label: "Monitor 1 (1920x1080)".into(),
@@ -253,5 +265,15 @@ mod tests {
 
         std::fs::write(&path, b"{not json").unwrap();
         assert_eq!(load(&path), SavedState::default());
+    }
+
+    #[test]
+    fn state_saved_by_0_3_still_names_the_file_on_the_desktop() {
+        let old = r#"{"current_wallpaper": "/cache/wallpaper_1_0.jpg"}"#;
+        let state: SavedState = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            state.on_desktop(),
+            vec![PathBuf::from("/cache/wallpaper_1_0.jpg")]
+        );
     }
 }

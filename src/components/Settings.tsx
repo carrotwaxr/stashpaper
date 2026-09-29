@@ -74,6 +74,10 @@ export default function SettingsPanel() {
   const connectionAttempt = useRef(0);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [monitors, setMonitors] = useState<MonitorInfo[]>([]);
+  // How this desktop handles a different image per monitor
+  const [perMonitorSupport, setPerMonitorSupport] = useState<
+    "native" | "spanned" | "unsupported" | null
+  >(null);
   // null until we know; stays null if the platform can't report it
   const [autostart, setAutostart] = useState<boolean | null>(null);
   const [autostartError, setAutostartError] = useState<string | null>(null);
@@ -92,6 +96,9 @@ export default function SettingsPanel() {
       });
     invoke<MonitorInfo[]>("detect_monitors")
       .then(setMonitors)
+      .catch(() => {});
+    invoke<"native" | "spanned" | "unsupported">("desktop_per_monitor")
+      .then(setPerMonitorSupport)
       .catch(() => {});
     invoke<boolean>("get_autostart")
       .then(setAutostart)
@@ -228,7 +235,11 @@ export default function SettingsPanel() {
       : settings.rotation_mode !== "random" && randomSort
         ? "Your filter sorts randomly. StashPaper fixes that order once, so this mode doesn't repeat images."
         : null;
-  const compositing = settings.per_monitor && monitors.length > 1;
+  // Per-monitor images are cropped to fill their monitor, spanned or native
+  const fitIgnored =
+    settings.per_monitor &&
+    monitors.length > 1 &&
+    (perMonitorSupport === "spanned" || perMonitorSupport === "native");
 
   const inputClass =
     "w-full rounded bg-zinc-800 border border-zinc-700 px-3 py-2 text-zinc-100 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500";
@@ -466,7 +477,7 @@ export default function SettingsPanel() {
             <SelectWrapper>
               <select
                 id="fit-mode"
-                disabled={compositing}
+                disabled={fitIgnored}
                 className={`${selectClass} disabled:opacity-50`}
                 style={{ color: "#f4f4f5", backgroundColor: "#27272a" }}
                 value={settings.fit_mode}
@@ -483,7 +494,7 @@ export default function SettingsPanel() {
                 ))}
               </select>
             </SelectWrapper>
-            {compositing && (
+            {fitIgnored && (
               <p className="text-xs text-zinc-500 mt-1">
                 Fit Mode doesn't apply to per-monitor wallpapers: each image is
                 cropped to fill its own monitor.
@@ -501,7 +512,13 @@ export default function SettingsPanel() {
               Different wallpaper per monitor
             </span>
           </label>
-          {monitors.length > 1 && settings.per_monitor && (
+          {settings.per_monitor && monitors.length > 1 && perMonitorSupport === "unsupported" && (
+            <p className="text-xs text-zinc-500 ml-6">
+              This desktop can't show a different image per monitor, so every
+              monitor gets the same one.
+            </p>
+          )}
+          {monitors.length > 1 && settings.per_monitor && perMonitorSupport !== "unsupported" && (
             <p className="text-xs text-zinc-500 ml-6">
               {monitors.length} monitors detected: {monitors.map((m) => `${m.width}x${m.height}`).join(" + ")}
             </p>

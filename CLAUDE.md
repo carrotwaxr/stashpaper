@@ -31,6 +31,7 @@ Run them all before committing. CI runs tests, clippy and the frontend build on 
 - Stash serves `paths.image` as the raw file: an image clip is a video, and a missing file is a plain-text error body. `download_image` checks the status, the content type (when sent) and that the bytes decode as an image before anything touches the desktop.
 - The query filter fails closed (`parse_query_filter`): an unknown key or bad JSON is an error, never an empty filter, because an empty filter rotates through the whole library.
 - GNOME has no per-monitor wallpapers. Per-monitor mode composites the images onto one canvas and sets it as `spanned`.
+- All wallpaper setting goes through `desktop.rs`: pick a `Placement`, and each `Backend` says what it supports via `per_monitor()`. Windows code there only compiles on Windows; lint it with `cargo clippy --target x86_64-pc-windows-msvc` on a copy of the module, since the crate's build script needs Windows tools.
 - WebKitGTK renders `<select>` options unreadable unless both the select and each option get explicit `color` and `backgroundColor` styles.
 - Linux tray: the app panics at startup without `libayatana-appindicator3` (or `libappindicator3`). Tray tooltips and left-click events don't exist on Linux, so status goes in the menu's first line, not only the tooltip.
 - Timers use `tokio::time::sleep`, whose clock stops while the machine is suspended. The engine sleeps at most a minute at a time and compares wall-clock time, so suspended time counts toward the interval.
