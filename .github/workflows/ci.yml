@@ -68,6 +68,10 @@ jobs:
 
       - name: Rust tests
         working-directory: src-tauri
+        # On the Windows runner, also set real wallpapers through
+        # IDesktopWallpaper (desktop::windows tests); a missing desktop fails
+        env:
+          STASHPAPER_DESKTOP_TEST: ${{ runner.os == 'Windows' && '1' || '' }}
         run: cargo test
 
       - name: Rust clippy

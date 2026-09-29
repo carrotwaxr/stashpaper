@@ -1,4 +1,5 @@
 mod compositor;
+mod desktop;
 mod engine;
 mod error;
 mod rotation;
@@ -170,6 +171,12 @@ fn window_ready() {
     log::info!("Settings window ready");
 }
 
+/// Whether this desktop can show a different image per monitor.
+#[tauri::command]
+fn desktop_per_monitor() -> desktop::PerMonitor {
+    desktop::Desktop::detect(None).per_monitor()
+}
+
 #[tauri::command]
 fn settings_load_warning(state: tauri::State<'_, AppState>) -> Option<String> {
     state
@@ -214,9 +221,14 @@ pub fn run() {
             set_autostart,
             settings_load_warning,
             window_ready,
+            desktop_per_monitor,
         ])
         .setup(|app| {
             log::info!("StashPaper {} starting", app.package_info().version);
+
+            // A tray app: no Dock icon
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             // Load settings
             let (loaded, load_warning) = settings::load(app.handle())?;

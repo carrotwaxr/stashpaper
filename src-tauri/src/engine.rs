@@ -49,8 +49,10 @@ struct Engine {
     state_path: Option<PathBuf>,
     /// `schedule::selection_key` of the settings the rotation position belongs to
     selection_key: String,
-    /// The file the last successful rotation put on the desktop
-    current: Option<PathBuf>,
+    /// The files the last successful rotation put on the desktop
+    current: Vec<PathBuf>,
+    /// Shared with the blocking thread that sets wallpapers
+    desktop: Arc<std::sync::Mutex<crate::desktop::Desktop>>,
     /// The images on the desktop, for "Open in Stash"
     shown: Vec<schedule::ShownImage>,
     /// The local date the tray was last drawn on, so "Changed at 14:05" can
@@ -94,7 +96,15 @@ impl Engine {
             .as_deref()
             .map(schedule::load)
             .unwrap_or_default();
-        Self::from_saved(saved, settings, state_path)
+        let state_dir = state_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf);
+        let mut engine = Self::from_saved(saved, settings, state_path);
+        engine.desktop = Arc::new(std::sync::Mutex::new(crate::desktop::Desktop::detect(
+            state_dir.as_deref(),
+        )));
+        engine
     }
 
     fn from_saved(
@@ -126,7 +136,8 @@ impl Engine {
             },
             state_path,
             selection_key,
-            current: saved.current_wallpaper,
+            current: saved.on_desktop(),
+            desktop: Arc::new(std::sync::Mutex::new(crate::desktop::Desktop::detect(None))),
             shown: saved.shown,
             refreshed_on: None,
             needs_refresh: false,
@@ -169,12 +180,12 @@ impl Engine {
     fn record(
         &mut self,
         now: SystemTime,
-        result: Result<(PathBuf, Vec<schedule::ShownImage>), AppError>,
+        result: Result<(Vec<PathBuf>, Vec<schedule::ShownImage>), AppError>,
         settings: &Settings,
     ) {
         match result {
             Ok((wallpaper_path, shown)) => {
-                self.current = Some(wallpaper_path);
+                self.current = wallpaper_path;
                 self.failures = 0;
                 self.last_failure = None;
                 self.last_success = Some(now);
@@ -237,7 +248,8 @@ impl Engine {
             &s,
             &mut self.rotation,
             &mut self.count_hint,
-            self.current.as_deref(),
+            &self.current,
+            &self.desktop,
             app,
         )
         .await;
@@ -263,7 +275,8 @@ impl Engine {
             last_rotated: self.last_success.map(schedule::unix_secs),
             selection_key: self.selection_key.clone(),
             rotation: self.rotation.snapshot(),
-            current_wallpaper: self.current.clone(),
+            current_files: self.current.clone(),
+            current_wallpaper: None,
             shown: self.shown.clone(),
             paused: self.status.paused,
         };
@@ -318,44 +331,6 @@ pub async fn run(mut rx: CommandRx, settings: Arc<RwLock<Settings>>, app: tauri:
         }
     }
     log::info!("Rotation engine stopped");
-}
-
-/// Set wallpaper with Span mode (for composited multi-monitor images).
-fn set_wallpaper_span(path: &str) -> Result<(), AppError> {
-    wallpaper::set_from_path(path).map_err(|e| AppError::Wallpaper(e.to_string()))?;
-
-    #[cfg(target_os = "linux")]
-    {
-        let uri = format!("file://{}", path);
-        let _ = std::process::Command::new("gsettings")
-            .args([
-                "set",
-                "org.gnome.desktop.background",
-                "picture-uri-dark",
-                &uri,
-            ])
-            .output();
-        let _ = std::process::Command::new("gsettings")
-            .args([
-                "set",
-                "org.gnome.desktop.background",
-                "picture-options",
-                "spanned",
-            ])
-            .output();
-    }
-
-    set_mode_or_log(wallpaper::Mode::Span);
-
-    Ok(())
-}
-
-/// Set the fit mode. The crate can't do this on macOS or on desktops it doesn't
-/// recognize, but by then the image itself is set, so that's not a failed rotation.
-fn set_mode_or_log(mode: wallpaper::Mode) {
-    if let Err(e) = wallpaper::set_mode(mode) {
-        log::warn!("Couldn't set the fit mode: {}", e);
-    }
 }
 
 /// How many unusable images a rotation skips before giving up.
@@ -495,74 +470,120 @@ async fn download_batch(
     }
 }
 
-fn path_str(path: &Path) -> Result<&str, AppError> {
-    path.to_str()
-        .ok_or_else(|| AppError::Wallpaper("Invalid file path".into()))
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PlanKind {
+    Single,
+    Composite,
+    PerMonitor,
 }
 
-/// Put `images` on the desktop through `set` (compositing them first for a
-/// multi-monitor layout), and only then delete older cache files. Deleting first
-/// would leave the desktop pointing at a missing file whenever a rotation fails.
-/// `set` gets the file and whether it's a spanned composite. `current` is the
-/// file the last successful rotation set, if known.
+/// How many images a rotation fetches and how they go on the desktop, from the
+/// per-monitor setting, the monitor count and what the desktop can do.
+/// Per-monitor only means something with several monitors and a desktop that
+/// can show it; otherwise every monitor gets the same image.
+fn plan_for(
+    per_monitor_setting: bool,
+    monitors: usize,
+    support: crate::desktop::PerMonitor,
+) -> (usize, PlanKind) {
+    use crate::desktop::PerMonitor;
+    if !per_monitor_setting || monitors < 2 {
+        return (1, PlanKind::Single);
+    }
+    match support {
+        PerMonitor::Native => (monitors, PlanKind::PerMonitor),
+        PerMonitor::Spanned => (monitors, PlanKind::Composite),
+        PerMonitor::Unsupported => (1, PlanKind::Single),
+    }
+}
+
+/// How a rotation's images go on the desktop.
+#[derive(Debug, Clone, Copy)]
+enum Plan<'a> {
+    /// The first image on every monitor
+    Single,
+    /// Composited onto one canvas spanning the monitors
+    Composite(&'a [crate::compositor::MonitorGeometry]),
+    /// Each image on its own monitor; the last repeats if there are fewer
+    PerMonitor(&'a [crate::MonitorInfo]),
+}
+
+/// Put `images` on the desktop through `set`, and only then delete older cache
+/// files. Deleting first would leave the desktop pointing at a missing file
+/// whenever a rotation fails. `current` is what the last successful rotation
+/// put on the desktop. Returns the files now on the desktop.
 fn apply_wallpaper(
     images: &[PathBuf],
-    monitors: Option<&[crate::compositor::MonitorGeometry]>,
+    plan: Plan,
     cache_dir: &Path,
-    current: Option<&Path>,
-    set: impl FnOnce(&str, bool) -> Result<(), AppError>,
-) -> Result<PathBuf, AppError> {
-    let wallpaper_path = match monitors {
-        Some(_) => cache_dir.join(format!(
-            "wallpaper_composite_{}.jpg",
-            stash::timestamp_millis()
-        )),
-        None => images[0].clone(),
-    };
-    if let Some(geoms) = monitors {
-        if let Err(e) = crate::compositor::composite_wallpaper(images, geoms, &wallpaper_path) {
-            // Nothing reached the desktop
-            discard(images);
-            discard(&[wallpaper_path]);
-            return Err(e);
+    current: &[PathBuf],
+    set: impl FnOnce(crate::desktop::Placement) -> Result<(), AppError>,
+) -> Result<Vec<PathBuf>, AppError> {
+    use crate::desktop::Placement;
+    let (on_desktop, result) = match plan {
+        Plan::Single => (vec![images[0].clone()], set(Placement::Single(&images[0]))),
+        Plan::Composite(geoms) => {
+            let composite = cache_dir.join(format!(
+                "wallpaper_composite_{}.jpg",
+                stash::timestamp_millis()
+            ));
+            if let Err(e) = crate::compositor::composite_wallpaper(images, geoms, &composite) {
+                // Nothing reached the desktop
+                discard(images);
+                discard(&[composite]);
+                return Err(e);
+            }
+            let result = set(Placement::Spanned(&composite));
+            (vec![composite], result)
         }
-    }
-    match set(path_str(&wallpaper_path)?, monitors.is_some()) {
+        Plan::PerMonitor(monitors) => {
+            let pairs: Vec<(crate::MonitorInfo, PathBuf)> = monitors
+                .iter()
+                .enumerate()
+                .map(|(i, m)| (m.clone(), images[i.min(images.len() - 1)].clone()))
+                .collect();
+            (images.to_vec(), set(Placement::PerMonitor(&pairs)))
+        }
+    };
+    let on_desktop_refs: Vec<&Path> = on_desktop.iter().map(PathBuf::as_path).collect();
+    match result {
         Ok(()) => {
-            stash::clean_wallpaper_cache(cache_dir, &[&wallpaper_path]);
-            Ok(wallpaper_path)
+            stash::clean_wallpaper_cache(cache_dir, &on_desktop_refs);
+            Ok(on_desktop)
         }
         Err(e) => {
             // A setter can fail after applying the file to some monitors or
-            // workspaces, so keep it along with the last good one. Everything
+            // workspaces, so keep it along with the last good ones. Everything
             // else goes, so repeated failures can't fill the cache. With no
             // known good file (first rotation since start), delete nothing
             // older: the desktop may still point at one of them.
-            match current {
-                Some(current) => {
-                    stash::clean_wallpaper_cache(cache_dir, &[&wallpaper_path, current])
-                }
-                None => discard(
+            if current.is_empty() {
+                discard(
                     &images
                         .iter()
-                        .filter(|p| **p != wallpaper_path)
+                        .filter(|p| !on_desktop.contains(p))
                         .cloned()
                         .collect::<Vec<_>>(),
-                ),
+                );
+            } else {
+                let mut keep = on_desktop_refs;
+                keep.extend(current.iter().map(PathBuf::as_path));
+                stash::clean_wallpaper_cache(cache_dir, &keep);
             }
             Err(e)
         }
     }
 }
 
-/// Run one rotation. Returns the file now on the desktop and the images on it.
+/// Run one rotation. Returns the files now on the desktop and the images on it.
 async fn rotate(
     s: &Settings,
     rotation_state: &mut RotationState,
     count_hint: &mut Option<usize>,
-    current: Option<&Path>,
+    current: &[PathBuf],
+    desktop: &Arc<std::sync::Mutex<crate::desktop::Desktop>>,
     app_handle: &tauri::AppHandle,
-) -> Result<(PathBuf, Vec<schedule::ShownImage>), AppError> {
+) -> Result<(Vec<PathBuf>, Vec<schedule::ShownImage>), AppError> {
     let client = stash::client_for(s)?;
 
     let cache_dir = app_handle
@@ -571,8 +592,12 @@ async fn rotate(
         .map_err(|e: tauri::Error| AppError::Settings(e.to_string()))?;
 
     let monitors = crate::monitor_infos(app_handle);
-    let per_monitor = s.per_monitor && monitors.len() > 1;
-    let wanted = if per_monitor { monitors.len() } else { 1 };
+    let support = desktop
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .per_monitor();
+    let (wanted, kind) = plan_for(s.per_monitor, monitors.len(), support);
+    let per_monitor = kind != PlanKind::Single;
 
     let picked = download_batch(&client, s, rotation_state, count_hint, wanted, &cache_dir).await?;
     let shown: Vec<schedule::ShownImage> = picked
@@ -603,77 +628,26 @@ async fn rotate(
 
     // Compositing, the wallpaper tools and file deletes all block, so keep them
     // off the async runtime
-    let settings = s.clone();
-    let current = current.map(Path::to_path_buf);
-    let wallpaper_path = tokio::task::spawn_blocking(move || {
-        apply_wallpaper(
-            &images,
-            per_monitor.then_some(geoms.as_slice()),
-            &cache_dir,
-            current.as_deref(),
-            |path, spanned| {
-                if spanned {
-                    set_wallpaper_span(path)
-                } else {
-                    set_wallpaper(path, &settings)
-                }
-            },
-        )
+    let fit = s.fit_mode;
+    let current = current.to_vec();
+    let desktop = desktop.clone();
+    let on_desktop = tokio::task::spawn_blocking(move || {
+        let plan = match kind {
+            PlanKind::PerMonitor => Plan::PerMonitor(&monitors),
+            PlanKind::Composite => Plan::Composite(&geoms),
+            PlanKind::Single => Plan::Single,
+        };
+        apply_wallpaper(&images, plan, &cache_dir, &current, |placement| {
+            desktop
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .apply(placement, fit)
+        })
     })
     .await
     .map_err(|e| AppError::Wallpaper(e.to_string()))??;
 
-    Ok((wallpaper_path, shown))
-}
-
-fn set_wallpaper(path: &str, settings: &Settings) -> Result<(), AppError> {
-    // Set wallpaper via the wallpaper crate (handles most DEs)
-    wallpaper::set_from_path(path).map_err(|e| AppError::Wallpaper(e.to_string()))?;
-
-    // GNOME fixes: set picture-uri-dark for dark mode, and picture-options
-    // to match fit_mode (important if switching back from per-monitor/spanned)
-    #[cfg(target_os = "linux")]
-    {
-        let uri = format!("file://{}", path);
-        let _ = std::process::Command::new("gsettings")
-            .args([
-                "set",
-                "org.gnome.desktop.background",
-                "picture-uri-dark",
-                &uri,
-            ])
-            .output();
-
-        let gnome_option = match settings.fit_mode {
-            crate::settings::FitMode::Center => "centered",
-            crate::settings::FitMode::Crop => "zoom",
-            crate::settings::FitMode::Fit => "scaled",
-            crate::settings::FitMode::Span => "spanned",
-            crate::settings::FitMode::Stretch => "stretched",
-            crate::settings::FitMode::Tile => "wallpaper",
-        };
-        let _ = std::process::Command::new("gsettings")
-            .args([
-                "set",
-                "org.gnome.desktop.background",
-                "picture-options",
-                gnome_option,
-            ])
-            .output();
-    }
-
-    // Set the wallpaper mode based on settings
-    let mode = match settings.fit_mode {
-        crate::settings::FitMode::Center => wallpaper::Mode::Center,
-        crate::settings::FitMode::Crop => wallpaper::Mode::Crop,
-        crate::settings::FitMode::Fit => wallpaper::Mode::Fit,
-        crate::settings::FitMode::Span => wallpaper::Mode::Span,
-        crate::settings::FitMode::Stretch => wallpaper::Mode::Stretch,
-        crate::settings::FitMode::Tile => wallpaper::Mode::Tile,
-    };
-    set_mode_or_log(mode);
-
-    Ok(())
+    Ok((on_desktop, shown))
 }
 
 #[cfg(test)]
@@ -1002,15 +976,21 @@ mod tests {
         (dir, old, new)
     }
 
+    use crate::desktop::Placement;
+
+    fn refuse(_: Placement) -> Result<(), AppError> {
+        Err(AppError::Wallpaper("desktop said no".into()))
+    }
+
     #[test]
     fn a_failed_set_keeps_the_current_wallpaper_file() {
         let (dir, old, new) = cache_with_old_wallpaper();
         let result = apply_wallpaper(
             std::slice::from_ref(&new),
-            None,
+            Plan::Single,
             dir.path(),
-            None,
-            |_, _| Err(AppError::Wallpaper("desktop said no".into())),
+            &[],
+            refuse,
         );
         assert!(result.is_err());
         // with no known good file, nothing older may go: the desktop could be on it
@@ -1026,10 +1006,10 @@ mod tests {
         std::fs::write(&stale, png_bytes()).unwrap();
         let result = apply_wallpaper(
             std::slice::from_ref(&new),
-            None,
+            Plan::Single,
             dir.path(),
-            Some(&current),
-            |_, _| Err(AppError::Wallpaper("desktop said no".into())),
+            std::slice::from_ref(&current),
+            refuse,
         );
         assert!(result.is_err());
         assert!(current.exists(), "the last good file stays");
@@ -1044,25 +1024,25 @@ mod tests {
     fn a_successful_set_cleans_up_everything_else() {
         let (dir, old, new) = cache_with_old_wallpaper();
         let mut set_to = None;
-        let path = apply_wallpaper(
+        let on_desktop = apply_wallpaper(
             std::slice::from_ref(&new),
-            None,
+            Plan::Single,
             dir.path(),
-            None,
-            |p, spanned| {
-                set_to = Some((p.to_string(), spanned));
+            &[],
+            |placement| {
+                set_to = Some(format!("{:?}", placement));
                 Ok(())
             },
         )
         .unwrap();
-        assert_eq!(path, new);
-        assert_eq!(set_to, Some((new.to_str().unwrap().to_string(), false)));
+        assert_eq!(on_desktop, vec![new.clone()]);
+        assert_eq!(set_to, Some(format!("{:?}", Placement::Single(&new))));
         assert!(!old.exists());
         assert!(new.exists());
     }
 
     #[test]
-    fn per_monitor_sets_the_composite_and_keeps_only_it() {
+    fn a_composite_is_spanned_and_is_all_that_stays() {
         let (dir, old, new) = cache_with_old_wallpaper();
         let monitors = [
             crate::compositor::MonitorGeometry {
@@ -1078,18 +1058,19 @@ mod tests {
                 height: 4,
             },
         ];
-        let path = apply_wallpaper(
+        let on_desktop = apply_wallpaper(
             &[old.clone(), new.clone()],
-            Some(&monitors),
+            Plan::Composite(&monitors),
             dir.path(),
-            None,
-            |_, spanned| {
-                assert!(spanned);
+            &[],
+            |placement| {
+                assert!(matches!(placement, Placement::Spanned(_)));
                 Ok(())
             },
         )
         .unwrap();
-        assert!(path
+        assert_eq!(on_desktop.len(), 1);
+        assert!(on_desktop[0]
             .file_name()
             .unwrap()
             .to_string_lossy()
@@ -1098,7 +1079,46 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().path())
             .collect();
-        assert_eq!(left, vec![path]);
+        assert_eq!(left, on_desktop);
+    }
+
+    #[test]
+    fn per_monitor_sets_each_image_and_keeps_them_all() {
+        let (dir, old, new) = cache_with_old_wallpaper();
+        let stale = dir.path().join("wallpaper_0_0.png");
+        std::fs::write(&stale, png_bytes()).unwrap();
+        let monitor = |x: i32| crate::MonitorInfo {
+            width: 1920,
+            height: 1080,
+            x,
+            y: 0,
+            scale_factor: 1.0,
+        };
+        // three monitors, two images: the last one repeats
+        let monitors = [monitor(0), monitor(1920), monitor(3840)];
+        let mut placed = Vec::new();
+        let on_desktop = apply_wallpaper(
+            &[old.clone(), new.clone()],
+            Plan::PerMonitor(&monitors),
+            dir.path(),
+            &[],
+            |placement| {
+                if let Placement::PerMonitor(pairs) = placement {
+                    placed = pairs.iter().map(|(m, p)| (m.x, p.clone())).collect();
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            placed,
+            vec![(0, old.clone()), (1920, new.clone()), (3840, new.clone())]
+        );
+        assert_eq!(on_desktop, vec![old.clone(), new.clone()]);
+        assert!(old.exists() && new.exists());
+        assert!(!stale.exists());
+        // no composite was made
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
     }
 
     // The loop's decisions, on a fake clock
@@ -1127,9 +1147,9 @@ mod tests {
         Engine::from_saved(SavedState::default(), settings, None)
     }
 
-    fn ok() -> Result<(PathBuf, Vec<ShownImage>), AppError> {
+    fn ok() -> Result<(Vec<PathBuf>, Vec<ShownImage>), AppError> {
         Ok((
-            PathBuf::from("/cache/wallpaper_1_0.jpg"),
+            vec![PathBuf::from("/cache/wallpaper_1_0.jpg")],
             vec![ShownImage {
                 id: "12".into(),
                 label: String::new(),
@@ -1138,7 +1158,7 @@ mod tests {
         ))
     }
 
-    fn failed() -> Result<(PathBuf, Vec<ShownImage>), AppError> {
+    fn failed() -> Result<(Vec<PathBuf>, Vec<ShownImage>), AppError> {
         Err(AppError::Stash("the server returned HTTP 502".into()))
     }
 
@@ -1337,5 +1357,25 @@ mod tests {
             engine.status.open[0].url,
             "http://old-server:9999/images/12"
         );
+    }
+
+    #[test]
+    fn the_plan_follows_the_setting_the_monitors_and_the_desktop() {
+        use crate::desktop::PerMonitor::{Native, Spanned, Unsupported};
+        let cases = [
+            ((false, 3, Native), (1, PlanKind::Single)),
+            ((true, 1, Native), (1, PlanKind::Single)),
+            ((true, 3, Native), (3, PlanKind::PerMonitor)),
+            ((true, 2, Spanned), (2, PlanKind::Composite)),
+            // KDE, XFCE, macOS, swaybg, feh: one image for all
+            ((true, 3, Unsupported), (1, PlanKind::Single)),
+        ];
+        for ((setting, monitors, support), expected) in cases {
+            assert_eq!(
+                plan_for(setting, monitors, support),
+                expected,
+                "{setting} {monitors} {support:?}"
+            );
+        }
     }
 }
