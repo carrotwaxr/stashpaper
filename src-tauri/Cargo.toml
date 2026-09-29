@@ -1,6 +1,6 @@
 [package]
 name = "stashpaper"
-version = "0.2.0"
+version = "0.2.1"
 description = "Desktop wallpaper rotator powered by Stash"
 authors = ["carrotwaxr"]
 edition = "2021"
@@ -22,17 +22,17 @@ tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls", "charset", "http2", "system-proxy"] }
 tokio = { version = "1", features = ["full"] }
 wallpaper = "3.2"
-rand = "0.9"
+rand = "0.10"
 thiserror = "2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
-tauri-plugin-single-instance = "2.5.0"
-tauri-plugin-autostart = "2.6.0"
-tauri-plugin-log = "2.10.0"
-log = "0.4.34"
-chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+tauri-plugin-single-instance = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-log = "2"
+log = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Not used directly: its "log" feature sends plugin errors (single-instance) to the log file
 tracing = { version = "0.1", features = ["log"] }
 
