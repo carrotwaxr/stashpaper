@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type {
   Settings,
@@ -68,6 +68,10 @@ export default function SettingsPanel() {
   });
   const [loadWarning, setLoadWarning] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
+  const [saving, setSaving] = useState(false);
+  // Bumped whenever the URL or key changes, so a slow Test Connection result
+  // for the old values is dropped
+  const connectionAttempt = useRef(0);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [monitors, setMonitors] = useState<MonitorInfo[]>([]);
   // null until we know; stays null if the platform can't report it
@@ -119,6 +123,7 @@ export default function SettingsPanel() {
     setSettings((prev) => ({ ...prev, [key]: value }));
     setSaveError(null);
     if (key === "stash_url" || key === "api_key") {
+      connectionAttempt.current += 1;
       setConnection({ state: "idle" });
     }
     // Reset test result when query-affecting fields change
@@ -128,20 +133,26 @@ export default function SettingsPanel() {
   }
 
   async function testConnection() {
+    const attempt = ++connectionAttempt.current;
     setConnection({ state: "testing" });
     try {
       await invoke("test_connection", {
         url: settings.stash_url,
         apiKey: settings.api_key,
       });
-      setConnection({ state: "connected" });
+      if (attempt === connectionAttempt.current) {
+        setConnection({ state: "connected" });
+      }
     } catch (err) {
-      setConnection({ state: "failed", error: String(err) });
+      if (attempt === connectionAttempt.current) {
+        setConnection({ state: "failed", error: String(err) });
+      }
     }
   }
 
   async function saveSettings() {
     setSaveError(null);
+    setSaving(true);
     try {
       // The backend normalizes the Server URL; show what was saved
       const stored = await invoke<Settings>("save_settings", {
@@ -153,6 +164,8 @@ export default function SettingsPanel() {
       setTimeout(() => setSaved(false), 2000);
     } catch (err) {
       setSaveError(String(err));
+    } finally {
+      setSaving(false);
     }
   }
 
@@ -527,7 +540,7 @@ export default function SettingsPanel() {
         <button
           type="button"
           onClick={saveSettings}
-          disabled={!!queryFilterError || testResult.status === "zero"}
+          disabled={saving || !!queryFilterError || testResult.status === "zero"}
           className="w-full rounded bg-blue-600 px-4 py-2.5 font-medium text-white hover:bg-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:ring-offset-zinc-900 disabled:opacity-50 disabled:cursor-not-allowed"
         >
           {saved

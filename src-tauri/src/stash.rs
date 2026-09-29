@@ -159,7 +159,7 @@ pub async fn test_connection(url: &str, api_key: &str) -> Result<(), AppError> {
     if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
         return Err(auth_error(status));
     }
-    let redirected_to = (resp.url().as_str() != url).then(|| resp.url().clone());
+    let redirected_to = was_redirected(&url, resp.url());
     let text = resp
         .text()
         .await
@@ -194,6 +194,15 @@ pub async fn test_connection(url: &str, api_key: &str) -> Result<(), AppError> {
     Err(AppError::Stash(
         "the server answered, but not like Stash: check the Server URL".into(),
     ))
+}
+
+/// Where a request ended up, if that's not where it was sent. Compared parsed,
+/// so case and default ports don't count as a redirect.
+fn was_redirected(sent: &str, landed: &reqwest::Url) -> Option<reqwest::Url> {
+    match reqwest::Url::parse(sent) {
+        Ok(sent) if sent == *landed => None,
+        _ => Some(landed.clone()),
+    }
 }
 
 /// A redirect turns the POST into a GET (except for 307/308), so a failure
@@ -347,7 +356,7 @@ async fn find_images(
     }
     // A redirect turns the POST into a GET (except for 307/308), so a failure
     // after one is best explained as "use the address it redirects to"
-    let redirected_to = (resp.url().as_str() != url).then(|| resp.url().clone());
+    let redirected_to = was_redirected(&url, resp.url());
     let body = resp
         .text()
         .await
@@ -821,6 +830,16 @@ mod tests {
         for (from, to) in refused {
             assert!(!redirect_allowed(&url(from), &url(to)), "{from} -> {to}");
         }
+    }
+
+    #[test]
+    fn test_case_and_default_ports_are_not_a_redirect() {
+        let landed = reqwest::Url::parse("http://desktop-ab12:9999/graphql").unwrap();
+        assert!(was_redirected("http://DESKTOP-AB12:9999/graphql", &landed).is_none());
+        let https = reqwest::Url::parse("https://stash.example.com/graphql").unwrap();
+        assert!(was_redirected("https://stash.example.com:443/graphql", &https).is_none());
+        let moved = reqwest::Url::parse("https://stash.example.com/graphql").unwrap();
+        assert!(was_redirected("http://stash.example.com/graphql", &moved).is_some());
     }
 
     #[test]

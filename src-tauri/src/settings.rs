@@ -129,9 +129,17 @@ fn load_from(path: &Path) -> Result<(Settings, Option<String>), AppError> {
     // Editors like Notepad add a byte order mark; serde doesn't want it
     let text = std::str::from_utf8(bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes))
         .map_err(|e| e.to_string());
-    let parsed = text.and_then(|text| serde_json::from_str(text).map_err(|e| e.to_string()));
+    let parsed =
+        text.and_then(|text| serde_json::from_str::<Settings>(text).map_err(|e| e.to_string()));
     match parsed {
-        Ok(settings) => Ok((settings, None)),
+        Ok(mut settings) => {
+            // Older versions saved the URL as typed; a URL that doesn't parse
+            // stays as it was, for the window to flag
+            if let Ok(url) = normalize_stash_url(&settings.stash_url) {
+                settings.stash_url = url;
+            }
+            Ok((settings, None))
+        }
         Err(e) => {
             log::warn!("Failed to parse settings, using defaults: {}", e);
             let warning = match back_up(path, &bytes) {
@@ -159,13 +167,22 @@ fn load_from(path: &Path) -> Result<(Settings, Option<String>), AppError> {
 /// with different contents is left alone and this one gets a timestamped name.
 fn back_up(path: &Path, contents: &[u8]) -> std::io::Result<PathBuf> {
     let backup = path.with_extension("json.bak");
-    match std::fs::read(&backup) {
-        Ok(existing) if existing == contents => return Ok(backup),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            write_private(&backup, contents)?;
-            return Ok(backup);
+    // The same broken file launch after launch needs only one backup
+    if let Some(dir) = path.parent() {
+        for entry in std::fs::read_dir(dir)?.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("settings.")
+                && name.ends_with(".bak")
+                && std::fs::read(entry.path()).is_ok_and(|existing| existing == contents)
+            {
+                return Ok(entry.path());
+            }
         }
-        _ => {}
+    }
+    if !backup.exists() {
+        write_private(&backup, contents)?;
+        return Ok(backup);
     }
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -191,8 +208,11 @@ fn save_to(path: &Path, settings: &Settings) -> Result<(), AppError> {
 /// from the moment the file exists (it holds the API key).
 fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
+    // Unique per write: two saves at once mustn't share (and unlink) one file
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
+    tmp.push(format!(".{}.{}.tmp", std::process::id(), n));
     let tmp = PathBuf::from(tmp);
     let _ = std::fs::remove_file(&tmp);
     let mut options = std::fs::OpenOptions::new();
@@ -235,14 +255,23 @@ pub fn normalize_stash_url(raw: &str) -> Result<String, AppError> {
     if url.is_empty() {
         return Ok(url);
     }
-    match reqwest::Url::parse(&url) {
-        Ok(parsed) if matches!(parsed.scheme(), "http" | "https") && parsed.host().is_some() => {
-            Ok(url)
-        }
-        _ => Err(AppError::Settings(
+    let invalid = || {
+        AppError::Settings(
             "the Server URL must look like http://host:9999 or https://stash.example.com".into(),
-        )),
+        )
+    };
+    let parsed = reqwest::Url::parse(&url).map_err(|_| invalid())?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host().is_none() {
+        return Err(invalid());
     }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(AppError::Settings(
+            "the Server URL can't have a ?query or #fragment: use just the server address".into(),
+        ));
+    }
+    // The parsed form (lowercase host and scheme, no default port) is what
+    // requests and redirect checks see, so store exactly that
+    Ok(parsed.as_str().trim_end_matches('/').to_string())
 }
 
 #[cfg(test)]
@@ -376,7 +405,14 @@ mod tests {
         ] {
             assert_eq!(normalize_stash_url(raw).unwrap(), want, "{raw}");
         }
-        for raw in ["localhost:9999", "stash.lan", "ftp://stash.lan", "http://"] {
+        for raw in [
+            "localhost:9999",
+            "stash.lan",
+            "ftp://stash.lan",
+            "http://",
+            "http://host:9999/?tab=images",
+            "http://host:9999/#top",
+        ] {
             assert!(normalize_stash_url(raw).is_err(), "{raw}");
         }
     }
@@ -473,6 +509,37 @@ mod tests {
     }
 
     #[test]
+    fn test_the_same_broken_file_is_backed_up_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, b"{broken one").unwrap();
+        load_from(&path).unwrap();
+        std::fs::write(&path, b"{broken two").unwrap();
+        for _ in 0..3 {
+            load_from(&path).unwrap();
+        }
+        let backups = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".bak")
+            })
+            .count();
+        assert_eq!(backups, 2);
+    }
+
+    #[test]
+    fn test_an_old_saved_url_is_normalized_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, br#"{"stash_url": "http://host:9999/graphql"}"#).unwrap();
+        assert_eq!(load_from(&path).unwrap().0.stash_url, "http://host:9999");
+    }
+
+    #[test]
     fn test_prepare_normalizes_the_url_and_checks_the_filter() {
         let prepared = prepare(Settings {
             stash_url: "http://host:9999/graphql".into(),
@@ -493,18 +560,24 @@ mod tests {
         .is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_save_goes_through_a_temp_file_and_never_writes_in_place() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         std::fs::write(&path, b"{\"api_key\": \"old\"}").unwrap();
-        // something in the way of the temp file: writing in place would
-        // succeed, going through the temp file can't
-        let blocker = dir.path().join("settings.json.tmp");
-        std::fs::create_dir(&blocker).unwrap();
-        std::fs::write(blocker.join("x"), b"x").unwrap();
+        // a read-only config dir: writing the file in place would succeed,
+        // creating a temp file next to it can't
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        if std::fs::write(dir.path().join("probe"), b"x").is_ok() {
+            // running as root, which ignores the mode
+            return;
+        }
+        let result = save_to(&path, &Settings::default());
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
 
-        assert!(save_to(&path, &Settings::default()).is_err());
+        assert!(result.is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"{\"api_key\": \"old\"}");
     }
 
@@ -522,7 +595,12 @@ mod tests {
         let (loaded, warning) = load_from(&path).unwrap();
         assert!(warning.is_none());
         assert_eq!(loaded.api_key, "secret");
-        assert!(!dir.path().join("settings.json.tmp").exists());
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     #[cfg(unix)]
