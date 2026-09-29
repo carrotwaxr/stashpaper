@@ -462,8 +462,7 @@ mod windows {
                 return;
             }
             let _com = Com::init().expect("COM");
-            let dw = desktop_wallpaper().expect("IDesktopWallpaper");
-            let system = monitors(&dw).unwrap();
+            let system = monitors(&desktop_wallpaper().expect("IDesktopWallpaper")).unwrap();
             assert!(!system.is_empty(), "no attached monitors");
 
             let dir = tempfile::tempdir().unwrap();
@@ -474,23 +473,46 @@ mod windows {
                     .unwrap();
                 path
             };
-            let wallpaper_of = |id: &str| -> String {
-                let raw = unsafe { dw.GetWallpaper(&HSTRING::from(id)) }.unwrap();
-                let text = unsafe { raw.to_string() }.unwrap();
-                unsafe { CoTaskMemFree(Some(raw.0 as *const _)) };
-                text
+            // What each monitor shows, read through a fresh object each time
+            // (one made before a change may not see it)
+            let shown = || -> Vec<Option<std::ffi::OsString>> {
+                let dw = desktop_wallpaper().unwrap();
+                system
+                    .iter()
+                    .map(|(id, _)| {
+                        let raw = unsafe { dw.GetWallpaper(&HSTRING::from(id.as_str())) }.unwrap();
+                        let text = unsafe { raw.to_string() }.unwrap();
+                        unsafe { CoTaskMemFree(Some(raw.0 as *const _)) };
+                        std::path::Path::new(&text)
+                            .file_name()
+                            .map(|n| n.to_owned())
+                    })
+                    .collect()
             };
-            let file_name = |p: &str| std::path::Path::new(p).file_name().map(|n| n.to_owned());
+            // Explorer may apply a change a moment later
+            let wait_for = |expected: Vec<Option<std::ffi::OsString>>| {
+                let mut got = shown();
+                for _ in 0..50 {
+                    if got == expected {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    got = shown();
+                }
+                panic!(
+                    "monitors {:?} show {:?}, expected {:?}",
+                    system, got, expected
+                );
+            };
 
             // One image everywhere, with the fit mode applied
             let everywhere = make("everywhere.png", 10);
             set_all(&everywhere, FitMode::Fit).unwrap();
-            for (id, _) in &system {
-                assert_eq!(
-                    file_name(&wallpaper_of(id)),
-                    everywhere.file_name().map(|n| n.to_owned())
-                );
-            }
+            wait_for(vec![
+                everywhere.file_name().map(|n| n.to_owned());
+                system.len()
+            ]);
+            let dw = desktop_wallpaper().unwrap();
             assert_eq!(unsafe { dw.GetPosition() }.unwrap(), DWPOS_FIT);
 
             // A different image per monitor
@@ -509,13 +531,13 @@ mod windows {
                 })
                 .collect();
             set_each(&images).unwrap();
-            for ((id, _), (_, path)) in system.iter().zip(&images) {
-                assert_eq!(
-                    file_name(&wallpaper_of(id)),
-                    path.file_name().map(|n| n.to_owned()),
-                    "monitor {id}"
-                );
-            }
+            wait_for(
+                images
+                    .iter()
+                    .map(|(_, path)| path.file_name().map(|n| n.to_owned()))
+                    .collect(),
+            );
+            let dw = desktop_wallpaper().unwrap();
             assert_eq!(unsafe { dw.GetPosition() }.unwrap(), DWPOS_FILL);
             eprintln!("checked {} monitor(s)", system.len());
         }
