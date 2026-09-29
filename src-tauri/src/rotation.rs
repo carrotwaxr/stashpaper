@@ -1,6 +1,6 @@
 use crate::settings::RotationMode;
 use rand::seq::SliceRandom;
-use rand::Rng;
+use rand::RngExt;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RotationResult {
