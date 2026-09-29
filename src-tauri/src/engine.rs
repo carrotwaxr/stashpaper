@@ -320,27 +320,6 @@ pub async fn run(mut rx: CommandRx, settings: Arc<RwLock<Settings>>, app: tauri:
     log::info!("Rotation engine stopped");
 }
 
-fn get_monitor_geometries(app: &tauri::AppHandle) -> Vec<crate::MonitorInfo> {
-    app.available_monitors()
-        .map(|monitors| {
-            monitors
-                .into_iter()
-                .map(|m| {
-                    let size = m.size();
-                    let pos = m.position();
-                    crate::MonitorInfo {
-                        width: size.width,
-                        height: size.height,
-                        x: pos.x,
-                        y: pos.y,
-                        scale_factor: m.scale_factor(),
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 /// Set wallpaper with Span mode (for composited multi-monitor images).
 fn set_wallpaper_span(path: &str) -> Result<(), AppError> {
     wallpaper::set_from_path(path).map_err(|e| AppError::Wallpaper(e.to_string()))?;
@@ -461,14 +440,21 @@ async fn download_batch(
                 Ok(paths)
             };
         }
-        let (fresh_count, image) =
-            match stash::fetch_image_at_page(client, settings, pick.page, pick.random_seed).await {
-                Ok(result) => result,
-                Err(e) => {
-                    discard(&paths);
-                    return Err(e);
-                }
-            };
+        let (fresh_count, image) = match stash::fetch_image_at_page(
+            client,
+            settings,
+            pick.page,
+            pick.random_seed,
+            Some(pick.sort_seed),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                discard(&paths);
+                return Err(e);
+            }
+        };
         count = fresh_count;
         *count_hint = Some(count);
         if count == 0 {
@@ -584,7 +570,7 @@ async fn rotate(
         .app_cache_dir()
         .map_err(|e: tauri::Error| AppError::Settings(e.to_string()))?;
 
-    let monitors = get_monitor_geometries(app_handle);
+    let monitors = crate::monitor_infos(app_handle);
     let per_monitor = s.per_monitor && monitors.len() > 1;
     let wanted = if per_monitor { monitors.len() } else { 1 };
 

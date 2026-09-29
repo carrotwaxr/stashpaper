@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 pub struct RotationResult {
     pub page: usize,
     pub random_seed: Option<u64>,
+    /// Fixes an explicit "random" sort in the other modes; see `build_variables`
+    pub sort_seed: u64,
 }
 
 #[derive(Debug)]
@@ -17,6 +19,11 @@ pub struct RotationState {
     last_count: usize,
     random_seed: Option<u64>,
     random_page: usize,
+    sort_seed: u64,
+}
+
+fn new_seed() -> u64 {
+    rand::rng().random_range(1..100_000_000u64)
 }
 
 /// The part of `RotationState` saved across restarts. The shuffle order isn't
@@ -27,6 +34,8 @@ pub struct RotationSnapshot {
     pub current_index: usize,
     pub random_seed: Option<u64>,
     pub random_page: usize,
+    /// 0 in state saved before this existed
+    pub sort_seed: u64,
 }
 
 impl RotationState {
@@ -35,6 +44,7 @@ impl RotationState {
             current_index: self.current_index,
             random_seed: self.random_seed,
             random_page: self.random_page,
+            sort_seed: self.sort_seed,
         }
     }
 
@@ -43,6 +53,11 @@ impl RotationState {
             current_index: snapshot.current_index,
             random_seed: snapshot.random_seed,
             random_page: snapshot.random_page,
+            sort_seed: if snapshot.sort_seed == 0 {
+                new_seed()
+            } else {
+                snapshot.sort_seed
+            },
             ..Self::new()
         }
     }
@@ -55,6 +70,7 @@ impl RotationState {
             last_count: 0,
             random_seed: None,
             random_page: 0,
+            sort_seed: new_seed(),
         }
     }
 
@@ -65,6 +81,7 @@ impl RotationState {
         self.last_count = 0;
         self.random_seed = None;
         self.random_page = 0;
+        self.sort_seed = new_seed();
     }
 
     /// Select the next page number (1-based) based on the rotation mode.
@@ -100,7 +117,7 @@ impl RotationState {
                     self.random_page = 0;
                 }
                 self.random_page += 1;
-                // Exhausted all pages — new seed, start over
+                // Exhausted all pages: new seed, start over
                 if self.random_page > count {
                     self.random_seed = Some(rng.random_range(0..100_000_000u64));
                     self.random_page = 1;
@@ -108,6 +125,7 @@ impl RotationState {
                 RotationResult {
                     page: self.random_page,
                     random_seed: self.random_seed,
+                    sort_seed: self.sort_seed,
                 }
             }
             RotationMode::Sequential => {
@@ -118,6 +136,7 @@ impl RotationState {
                 RotationResult {
                     page: self.current_index,
                     random_seed: None,
+                    sort_seed: self.sort_seed,
                 }
             }
             RotationMode::Shuffle => {
@@ -129,6 +148,7 @@ impl RotationState {
                 RotationResult {
                     page,
                     random_seed: None,
+                    sort_seed: self.sort_seed,
                 }
             }
         })
@@ -235,7 +255,7 @@ mod tests {
         }
         assert_eq!(state.current_index, 3);
 
-        // Count shrinks to 2 — index should clamp
+        // Count shrinks to 2, so the index should clamp
         let r = state.select_next(RotationMode::Sequential, 2).unwrap();
         assert!(r.page >= 1 && r.page <= 2);
     }
@@ -331,5 +351,32 @@ mod tests {
         let next = restored.select_next(RotationMode::Random, 10).unwrap();
         assert_eq!(next.random_seed, first.random_seed);
         assert_eq!(next.page, 3);
+    }
+
+    #[test]
+    fn test_sort_seed_is_stable_until_reset_and_survives_a_restart() {
+        let mut state = RotationState::new();
+        let a = state.select_next(RotationMode::Sequential, 10).unwrap();
+        let b = state.select_next(RotationMode::Shuffle, 10).unwrap();
+        assert_eq!(a.sort_seed, b.sort_seed);
+        assert_ne!(a.sort_seed, 0);
+
+        let mut restored = RotationState::from_snapshot(state.snapshot());
+        let c = restored.select_next(RotationMode::Sequential, 10).unwrap();
+        assert_eq!(c.sort_seed, a.sort_seed);
+
+        // state saved before the seed existed gets a fresh one
+        let old = RotationSnapshot {
+            current_index: 3,
+            ..RotationSnapshot::default()
+        };
+        let mut from_old = RotationState::from_snapshot(old);
+        assert_ne!(
+            from_old
+                .select_next(RotationMode::Sequential, 10)
+                .unwrap()
+                .sort_seed,
+            0
+        );
     }
 }

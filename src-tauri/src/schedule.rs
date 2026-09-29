@@ -225,6 +225,7 @@ mod tests {
                 current_index: 7,
                 random_seed: Some(42),
                 random_page: 3,
+                sort_seed: 99,
             },
             current_wallpaper: Some(PathBuf::from("/cache/wallpaper_1_0.jpg")),
             shown: vec![ShownImage {
