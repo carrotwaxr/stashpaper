@@ -29,7 +29,6 @@ export interface Settings {
   fit_mode: FitMode;
   min_resolution: MinResolution;
   per_monitor: boolean;
-  wifi_only: boolean;
 }
 
 export const INTERVAL_LABELS: Record<Interval, string> = {

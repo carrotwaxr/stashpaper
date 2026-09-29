@@ -33,6 +33,12 @@ if ! grep -q "StashPaper .* starting" "$log"; then
   echo "The log has no startup line"
   exit 1
 fi
+# The window is shown on first run; this line means it rendered (CSP, React
+# and IPC all working)
+if ! grep -q "Settings window ready" "$log"; then
+  echo "The settings window never reported that it rendered"
+  exit 1
+fi
 
 # A second copy should hand over to the first (which logs it) and exit
 if ! timeout 20 "$app" >"$home/second.out" 2>&1; then

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tauri::Manager;
 
@@ -16,7 +16,6 @@ pub struct Settings {
     pub fit_mode: FitMode,
     pub min_resolution: MinResolution,
     pub per_monitor: bool,
-    pub wifi_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -102,7 +101,6 @@ impl Default for Settings {
             fit_mode: FitMode::Crop,
             min_resolution: MinResolution::None,
             per_monitor: false,
-            wifi_only: false,
         }
     }
 }
@@ -116,39 +114,164 @@ fn settings_path(app: &tauri::AppHandle) -> Result<PathBuf, AppError> {
     Ok(config_dir.join("settings.json"))
 }
 
-pub fn load(app: &tauri::AppHandle) -> Result<Settings, AppError> {
-    let path = settings_path(app)?;
+/// Load settings. A file that doesn't parse is kept as `settings.json.bak`, and
+/// the second value says so, so the next save can't silently overwrite the only
+/// copy of the user's API key and filter.
+pub fn load(app: &tauri::AppHandle) -> Result<(Settings, Option<String>), AppError> {
+    load_from(&settings_path(app)?)
+}
+
+fn load_from(path: &Path) -> Result<(Settings, Option<String>), AppError> {
     if !path.exists() {
-        return Ok(Settings::default());
+        return Ok((Settings::default(), None));
     }
-    let contents = std::fs::read_to_string(&path)?;
-    match serde_json::from_str(&contents) {
-        Ok(settings) => Ok(settings),
+    let bytes = std::fs::read(path)?;
+    // Editors like Notepad add a byte order mark; serde doesn't want it
+    let text = std::str::from_utf8(bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes))
+        .map_err(|e| e.to_string());
+    let parsed =
+        text.and_then(|text| serde_json::from_str::<Settings>(text).map_err(|e| e.to_string()));
+    match parsed {
+        Ok(mut settings) => {
+            // Older versions saved the URL as typed; a URL that doesn't parse
+            // stays as it was, for the window to flag
+            if let Ok(url) = normalize_stash_url(&settings.stash_url) {
+                settings.stash_url = url;
+            }
+            Ok((settings, None))
+        }
         Err(e) => {
             log::warn!("Failed to parse settings, using defaults: {}", e);
-            Ok(Settings::default())
+            let warning = match back_up(path, &bytes) {
+                Ok(backup) => format!(
+                    "Your settings file couldn't be read ({}), so these are the defaults. \
+                     The old file is saved as {}.",
+                    e,
+                    backup.display()
+                ),
+                Err(backup_error) => {
+                    log::warn!("Couldn't back up the settings file: {}", backup_error);
+                    format!(
+                        "Your settings file couldn't be read ({}), so these are the defaults, \
+                         and it couldn't be backed up ({}). Saving will replace it.",
+                        e, backup_error
+                    )
+                }
+            };
+            Ok((Settings::default(), Some(warning)))
         }
     }
 }
 
+/// Keep an unreadable settings file next to the real one. An existing backup
+/// with different contents is left alone and this one gets a timestamped name.
+fn back_up(path: &Path, contents: &[u8]) -> std::io::Result<PathBuf> {
+    let backup = path.with_extension("json.bak");
+    // The same broken file launch after launch needs only one backup
+    if let Some(dir) = path.parent() {
+        for entry in std::fs::read_dir(dir)?.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("settings.")
+                && name.ends_with(".bak")
+                && std::fs::read(entry.path()).is_ok_and(|existing| existing == contents)
+            {
+                return Ok(entry.path());
+            }
+        }
+    }
+    if !backup.exists() {
+        write_private(&backup, contents)?;
+        return Ok(backup);
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let dated = path.with_extension(format!("{}.json.bak", secs));
+    write_private(&dated, contents)?;
+    Ok(dated)
+}
+
 pub fn save(app: &tauri::AppHandle, settings: &Settings) -> Result<(), AppError> {
-    let path = settings_path(app)?;
+    save_to(&settings_path(app)?, settings)
+}
+
+fn save_to(path: &Path, settings: &Settings) -> Result<(), AppError> {
     let contents =
         serde_json::to_string_pretty(settings).map_err(|e| AppError::Settings(e.to_string()))?;
-    std::fs::write(&path, &contents)?;
-
-    // Restrict file permissions to owner-only (contains API key)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
-
+    write_private(path, contents.as_bytes())?;
     Ok(())
 }
 
+/// Write `contents` to `path` atomically, and on Unix readable only by the owner
+/// from the moment the file exists (it holds the API key).
+fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    // Unique per write: two saves at once mustn't share (and unlink) one file
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".{}.{}.tmp", std::process::id(), n));
+    let tmp = PathBuf::from(tmp);
+    let _ = std::fs::remove_file(&tmp);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, path)
+}
+
+/// Settings as the window sent them, cleaned up and checked before they're
+/// saved or tested: the URL normalized, the filter one the engine can apply.
+pub fn prepare(mut settings: Settings) -> Result<Settings, AppError> {
+    settings.stash_url = normalize_stash_url(&settings.stash_url)?;
+    crate::stash::parse_query_filter(&settings.query_filter)?;
+    Ok(settings)
+}
+
+/// A Stash server URL is all it takes: the API key is only needed when Stash has
+/// a login configured, and it has none out of the box.
 pub fn is_configured(settings: &Settings) -> bool {
-    !settings.stash_url.is_empty() && !settings.api_key.is_empty()
+    !settings.stash_url.trim().is_empty()
+}
+
+/// Clean up a Server URL as typed: trim it, drop trailing slashes and a trailing
+/// `/graphql` (the app adds that itself), and require http or https. Blank stays
+/// blank (not configured yet).
+pub fn normalize_stash_url(raw: &str) -> Result<String, AppError> {
+    let mut url = raw.trim().trim_end_matches('/').to_string();
+    if url.to_ascii_lowercase().ends_with("/graphql") {
+        url.truncate(url.len() - "/graphql".len());
+        url = url.trim_end_matches('/').to_string();
+    }
+    if url.is_empty() {
+        return Ok(url);
+    }
+    let invalid = || {
+        AppError::Settings(
+            "the Server URL must look like http://host:9999 or https://stash.example.com".into(),
+        )
+    };
+    let parsed = reqwest::Url::parse(&url).map_err(|_| invalid())?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host().is_none() {
+        return Err(invalid());
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(AppError::Settings(
+            "the Server URL can't have a ?query or #fragment: use just the server address".into(),
+        ));
+    }
+    // The parsed form (lowercase host and scheme, no default port) is what
+    // requests and redirect checks see, so store exactly that
+    Ok(parsed.as_str().trim_end_matches('/').to_string())
 }
 
 #[cfg(test)]
@@ -168,7 +291,6 @@ mod tests {
             fit_mode: FitMode::Crop,
             min_resolution: MinResolution::None,
             per_monitor: true,
-            wifi_only: false,
         };
 
         let json = serde_json::to_string(&settings).unwrap();
@@ -187,7 +309,6 @@ mod tests {
         assert_eq!(settings.rotation_mode, RotationMode::Random);
         assert_eq!(settings.interval, Interval::ThirtyMinutes);
         assert!(!settings.per_monitor);
-        assert!(!settings.wifi_only);
     }
 
     #[test]
@@ -211,7 +332,6 @@ mod tests {
         assert_eq!(settings.interval, Interval::ThirtyMinutes);
         assert_eq!(settings.fit_mode, FitMode::Crop);
         assert!(!settings.per_monitor);
-        assert!(!settings.wifi_only);
     }
 
     #[test]
@@ -257,14 +377,242 @@ mod tests {
     }
 
     #[test]
-    fn test_is_configured() {
+    fn test_is_configured_needs_only_a_url() {
         let mut settings = Settings::default();
         assert!(!is_configured(&settings));
 
+        // Stash has no login out of the box, so no API key is fine
         settings.stash_url = "http://localhost:9999".into();
-        assert!(!is_configured(&settings));
-
-        settings.api_key = "key".into();
         assert!(is_configured(&settings));
+    }
+
+    #[test]
+    fn test_normalize_stash_url() {
+        for (raw, want) in [
+            ("", ""),
+            ("   ", ""),
+            ("http://localhost:9999", "http://localhost:9999"),
+            ("  http://localhost:9999/  ", "http://localhost:9999"),
+            ("http://localhost:9999/graphql", "http://localhost:9999"),
+            (
+                "https://stash.example.com/GraphQL/",
+                "https://stash.example.com",
+            ),
+            (
+                "https://example.com/stash/graphql",
+                "https://example.com/stash",
+            ),
+        ] {
+            assert_eq!(normalize_stash_url(raw).unwrap(), want, "{raw}");
+        }
+        for raw in [
+            "localhost:9999",
+            "stash.lan",
+            "ftp://stash.lan",
+            "http://",
+            "http://host:9999/?tab=images",
+            "http://host:9999/#top",
+        ] {
+            assert!(normalize_stash_url(raw).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn test_old_settings_with_wifi_only_still_load() {
+        let json = r#"{"stash_url": "http://localhost:9999", "wifi_only": true}"#;
+        let settings: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.stash_url, "http://localhost:9999");
+    }
+
+    #[test]
+    fn test_a_bad_settings_file_is_kept_and_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            b"{\"stash_url\": \"http://x\", \"interval\": \"hourly\"}",
+        )
+        .unwrap();
+
+        let (settings, warning) = load_from(&path).unwrap();
+        assert!(settings.stash_url.is_empty(), "falls back to defaults");
+        let warning = warning.expect("the user is told");
+        assert!(warning.contains("settings.json.bak"), "{warning}");
+        assert_eq!(
+            std::fs::read(dir.path().join("settings.json.bak")).unwrap(),
+            std::fs::read(&path).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_a_second_broken_file_doesnt_overwrite_the_first_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, b"{broken one").unwrap();
+        load_from(&path).unwrap();
+        std::fs::write(&path, b"{broken two").unwrap();
+        let (_, warning) = load_from(&path).unwrap();
+
+        assert_eq!(
+            std::fs::read(dir.path().join("settings.json.bak")).unwrap(),
+            b"{broken one"
+        );
+        let warning = warning.unwrap();
+        assert!(!warning.contains("settings.json.bak."), "{warning}");
+        let dated: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| {
+                name.starts_with("settings.")
+                    && name.ends_with(".json.bak")
+                    && name != "settings.json.bak"
+            })
+            .collect();
+        assert_eq!(dated.len(), 1, "{dated:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_failed_backup_still_starts_with_defaults() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, b"{broken").unwrap();
+        // a read-only config dir: the backup can't be written
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        if std::fs::write(dir.path().join("probe"), b"x").is_ok() {
+            // running as root, which ignores the mode
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        let result = load_from(&path);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let (settings, warning) = result.unwrap();
+        assert!(settings.stash_url.is_empty());
+        assert!(warning.unwrap().contains("couldn't be backed up"));
+    }
+
+    #[test]
+    fn test_a_bom_or_non_utf8_file_never_stops_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, b"\xEF\xBB\xBF{\"stash_url\": \"http://x:9999\"}").unwrap();
+        let (settings, warning) = load_from(&path).unwrap();
+        assert_eq!(settings.stash_url, "http://x:9999");
+        assert!(warning.is_none());
+
+        std::fs::write(&path, b"{\"stash_url\": \"caf\xE9\"}").unwrap();
+        let (settings, warning) = load_from(&path).unwrap();
+        assert!(settings.stash_url.is_empty());
+        assert!(warning.is_some());
+    }
+
+    #[test]
+    fn test_the_same_broken_file_is_backed_up_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, b"{broken one").unwrap();
+        load_from(&path).unwrap();
+        std::fs::write(&path, b"{broken two").unwrap();
+        for _ in 0..3 {
+            load_from(&path).unwrap();
+        }
+        let backups = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".bak")
+            })
+            .count();
+        assert_eq!(backups, 2);
+    }
+
+    #[test]
+    fn test_an_old_saved_url_is_normalized_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, br#"{"stash_url": "http://host:9999/graphql"}"#).unwrap();
+        assert_eq!(load_from(&path).unwrap().0.stash_url, "http://host:9999");
+    }
+
+    #[test]
+    fn test_prepare_normalizes_the_url_and_checks_the_filter() {
+        let prepared = prepare(Settings {
+            stash_url: "http://host:9999/graphql".into(),
+            ..Settings::default()
+        })
+        .unwrap();
+        assert_eq!(prepared.stash_url, "http://host:9999");
+
+        assert!(prepare(Settings {
+            stash_url: "host:9999".into(),
+            ..Settings::default()
+        })
+        .is_err());
+        assert!(prepare(Settings {
+            query_filter: r#"{"imagefilter": {}}"#.into(),
+            ..Settings::default()
+        })
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_save_goes_through_a_temp_file_and_never_writes_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, b"{\"api_key\": \"old\"}").unwrap();
+        // a read-only config dir: writing the file in place would succeed,
+        // creating a temp file next to it can't
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        if std::fs::write(dir.path().join("probe"), b"x").is_ok() {
+            // running as root, which ignores the mode
+            return;
+        }
+        let result = save_to(&path, &Settings::default());
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"api_key\": \"old\"}");
+    }
+
+    #[test]
+    fn test_save_round_trips_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let settings = Settings {
+            stash_url: "http://localhost:9999".into(),
+            api_key: "secret".into(),
+            ..Settings::default()
+        };
+        save_to(&path, &settings).unwrap();
+        save_to(&path, &settings).unwrap(); // overwriting works too
+        let (loaded, warning) = load_from(&path).unwrap();
+        assert!(warning.is_none());
+        assert_eq!(loaded.api_key, "secret");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_saved_settings_are_private_even_over_an_open_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, b"{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        save_to(&path, &Settings::default()).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }

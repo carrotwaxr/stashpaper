@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type {
   Settings,
@@ -24,10 +24,13 @@ const DEFAULT_SETTINGS: Settings = {
   fit_mode: "crop",
   min_resolution: "none",
   per_monitor: false,
-  wifi_only: false,
 };
 
-type ConnectionStatus = "idle" | "testing" | "connected" | "failed";
+type ConnectionStatus =
+  | { state: "idle" }
+  | { state: "testing" }
+  | { state: "connected" }
+  | { state: "failed"; error: string };
 type TestQueryResult =
   | { status: "idle" }
   | { status: "testing" }
@@ -60,9 +63,15 @@ function SelectWrapper({ children }: { children: React.ReactNode }) {
 
 export default function SettingsPanel() {
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
-  const [connectionStatus, setConnectionStatus] =
-    useState<ConnectionStatus>("idle");
+  const [connection, setConnection] = useState<ConnectionStatus>({
+    state: "idle",
+  });
+  const [loadWarning, setLoadWarning] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
+  const [saving, setSaving] = useState(false);
+  // Bumped whenever the URL or key changes, so a slow Test Connection result
+  // for the old values is dropped
+  const connectionAttempt = useRef(0);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [monitors, setMonitors] = useState<MonitorInfo[]>([]);
   // null until we know; stays null if the platform can't report it
@@ -89,6 +98,11 @@ export default function SettingsPanel() {
       .catch((err) =>
         setAutostartError(`Couldn't check start at login: ${String(err)}`),
       );
+    invoke<string | null>("settings_load_warning")
+      .then(setLoadWarning)
+      .catch(() => {});
+    // Tells the log (and the CI smoke test) the window rendered
+    invoke("window_ready").catch(() => {});
   }, []);
 
   // Applies immediately: it's an OS setting, not part of settings.json
@@ -108,6 +122,10 @@ export default function SettingsPanel() {
   function update<K extends keyof Settings>(key: K, value: Settings[K]) {
     setSettings((prev) => ({ ...prev, [key]: value }));
     setSaveError(null);
+    if (key === "stash_url" || key === "api_key") {
+      connectionAttempt.current += 1;
+      setConnection({ state: "idle" });
+    }
     // Reset test result when query-affecting fields change
     if (key === "query_filter" || key === "min_resolution") {
       setTestResult({ status: "idle" });
@@ -115,26 +133,39 @@ export default function SettingsPanel() {
   }
 
   async function testConnection() {
-    setConnectionStatus("testing");
+    const attempt = ++connectionAttempt.current;
+    setConnection({ state: "testing" });
     try {
-      const ok = await invoke<boolean>("test_connection", {
+      await invoke("test_connection", {
         url: settings.stash_url,
         apiKey: settings.api_key,
       });
-      setConnectionStatus(ok ? "connected" : "failed");
-    } catch {
-      setConnectionStatus("failed");
+      if (attempt === connectionAttempt.current) {
+        setConnection({ state: "connected" });
+      }
+    } catch (err) {
+      if (attempt === connectionAttempt.current) {
+        setConnection({ state: "failed", error: String(err) });
+      }
     }
   }
 
   async function saveSettings() {
     setSaveError(null);
+    setSaving(true);
     try {
-      await invoke("save_settings", { newSettings: settings });
+      // The backend normalizes the Server URL; show what was saved
+      const stored = await invoke<Settings>("save_settings", {
+        newSettings: settings,
+      });
+      setSettings(stored);
+      setLoadWarning(null);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     } catch (err) {
       setSaveError(String(err));
+    } finally {
+      setSaving(false);
     }
   }
 
@@ -181,6 +212,24 @@ export default function SettingsPanel() {
     return null;
   }, [settings.query_filter]);
 
+  // The filter's own sort, if it sets one, for the notes under Mode
+  const filterSort = useMemo(() => {
+    try {
+      const sort = JSON.parse(settings.query_filter)?.filter?.sort;
+      return typeof sort === "string" ? sort : null;
+    } catch {
+      return null;
+    }
+  }, [settings.query_filter]);
+  const randomSort = filterSort !== null && filterSort.startsWith("random");
+  const modeNote =
+    settings.rotation_mode === "random" && filterSort !== null && !randomSort
+      ? `Your filter sorts by "${filterSort}", so images follow that order. Remove the sort from the filter for a random order.`
+      : settings.rotation_mode !== "random" && randomSort
+        ? "Your filter sorts randomly. StashPaper fixes that order once, so this mode doesn't repeat images."
+        : null;
+  const compositing = settings.per_monitor && monitors.length > 1;
+
   const inputClass =
     "w-full rounded bg-zinc-800 border border-zinc-700 px-3 py-2 text-zinc-100 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500";
   const selectClass =
@@ -194,12 +243,21 @@ export default function SettingsPanel() {
       <div className="mx-auto max-w-lg space-y-6">
         <h1 className="text-2xl font-bold">StashPaper Settings</h1>
 
+        {loadWarning && (
+          <p className="rounded border border-amber-600 bg-amber-950 p-3 text-sm text-amber-200">
+            {loadWarning}
+          </p>
+        )}
+
         {/* Stash Connection */}
         <section className={sectionClass}>
           <h2 className={headingClass}>Stash Connection</h2>
           <div>
-            <label className={labelClass}>Server URL</label>
+            <label htmlFor="stash-url" className={labelClass}>
+              Server URL
+            </label>
             <input
+              id="stash-url"
               type="text"
               className={inputClass}
               value={settings.stash_url}
@@ -208,38 +266,46 @@ export default function SettingsPanel() {
             />
           </div>
           <div>
-            <label className={labelClass}>API Key</label>
+            <label htmlFor="api-key" className={labelClass}>
+              API Key (optional)
+            </label>
             <input
+              id="api-key"
               type="password"
               className={inputClass}
               value={settings.api_key}
               onChange={(e) => update("api_key", e.target.value)}
-              placeholder="Enter API key"
+              placeholder="Only needed if your Stash has a login"
             />
           </div>
           <div className="flex items-center gap-3">
             <button
               type="button"
               onClick={testConnection}
-              disabled={connectionStatus === "testing"}
-              className="rounded bg-zinc-700 px-4 py-2 text-sm font-medium text-zinc-100 hover:bg-zinc-600 disabled:opacity-50"
+              disabled={connection.state === "testing" || !settings.stash_url.trim()}
+              title={settings.stash_url.trim() ? undefined : "Enter the Server URL first"}
+              className="rounded bg-zinc-700 px-4 py-2 text-sm font-medium text-zinc-100 hover:bg-zinc-600 disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              {connectionStatus === "testing"
+              {connection.state === "testing"
                 ? "Testing..."
                 : "Test Connection"}
             </button>
-            {connectionStatus === "connected" && (
-              <span className="text-sm text-green-400">Connected</span>
-            )}
-            {connectionStatus === "failed" && (
-              <span className="text-sm text-red-400">Connection failed</span>
-            )}
+            <span role="status" className="min-w-0 text-sm">
+              {connection.state === "connected" && (
+                <span className="text-green-400">Connected</span>
+              )}
+              {connection.state === "failed" && (
+                <span className="text-red-400">{connection.error}</span>
+              )}
+            </span>
           </div>
         </section>
 
         {/* Query Filter */}
         <section className={sectionClass}>
-          <h2 className={headingClass}>Query Filter</h2>
+          <h2 className={headingClass}>
+            <label htmlFor="query-filter">Query Filter</label>
+          </h2>
           <p className="text-sm text-zinc-400">
             JSON with <code className="rounded bg-zinc-800 px-1">filter</code>{" "}
             (sort, direction) and{" "}
@@ -247,6 +313,7 @@ export default function SettingsPanel() {
             (tags, resolution, rating, etc.) from Stash's GraphQL Playground.
           </p>
           <textarea
+            id="query-filter"
             className={`${inputClass} font-mono text-xs ${queryFilterError ? "border-red-500 focus:ring-red-500" : ""}`}
             rows={8}
             spellCheck={false}
@@ -265,9 +332,9 @@ export default function SettingsPanel() {
               disabled={
                 !!queryFilterError ||
                 testResult.status === "testing" ||
-                !settings.stash_url ||
-                !settings.api_key
+                !settings.stash_url.trim()
               }
+              title={settings.stash_url.trim() ? undefined : "Enter the Server URL first"}
               className="rounded bg-zinc-700 px-4 py-2 text-sm font-medium text-zinc-100 hover:bg-zinc-600 disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {testResult.status === "testing"
@@ -281,7 +348,7 @@ export default function SettingsPanel() {
             )}
             {testResult.status === "zero" && (
               <span className="text-sm text-red-400">
-                No images found — check your filter
+                No images match. Check the filter and minimum resolution
               </span>
             )}
             {testResult.status === "error" && (
@@ -297,9 +364,12 @@ export default function SettingsPanel() {
           <h2 className={headingClass}>Rotation</h2>
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className={labelClass}>Mode</label>
+              <label htmlFor="rotation-mode" className={labelClass}>
+                Mode
+              </label>
               <SelectWrapper>
                 <select
+                  id="rotation-mode"
                   className={selectClass}
                   style={{ color: "#f4f4f5", backgroundColor: "#27272a" }}
                   value={settings.rotation_mode}
@@ -321,9 +391,12 @@ export default function SettingsPanel() {
               </SelectWrapper>
             </div>
             <div>
-              <label className={labelClass}>Interval</label>
+              <label htmlFor="interval" className={labelClass}>
+                Interval
+              </label>
               <SelectWrapper>
                 <select
+                  id="interval"
                   className={selectClass}
                   style={{ color: "#f4f4f5", backgroundColor: "#27272a" }}
                   value={settings.interval}
@@ -342,15 +415,19 @@ export default function SettingsPanel() {
               </SelectWrapper>
             </div>
           </div>
+          {modeNote && <p className="text-xs text-zinc-400">{modeNote}</p>}
         </section>
 
         {/* Display */}
         <section className={sectionClass}>
           <h2 className={headingClass}>Display</h2>
           <div>
-            <label className={labelClass}>Minimum Resolution</label>
+            <label htmlFor="min-resolution" className={labelClass}>
+              Minimum Resolution
+            </label>
             <SelectWrapper>
               <select
+                id="min-resolution"
                 className={selectClass}
                 style={{ color: "#f4f4f5", backgroundColor: "#27272a" }}
                 value={settings.min_resolution}
@@ -383,10 +460,14 @@ export default function SettingsPanel() {
             )}
           </div>
           <div>
-            <label className={labelClass}>Fit Mode</label>
+            <label htmlFor="fit-mode" className={labelClass}>
+              Fit Mode
+            </label>
             <SelectWrapper>
               <select
-                className={selectClass}
+                id="fit-mode"
+                disabled={compositing}
+                className={`${selectClass} disabled:opacity-50`}
                 style={{ color: "#f4f4f5", backgroundColor: "#27272a" }}
                 value={settings.fit_mode}
                 onChange={(e) =>
@@ -402,6 +483,12 @@ export default function SettingsPanel() {
                 ))}
               </select>
             </SelectWrapper>
+            {compositing && (
+              <p className="text-xs text-zinc-500 mt-1">
+                Fit Mode doesn't apply to per-monitor wallpapers: each image is
+                cropped to fill its own monitor.
+              </p>
+            )}
           </div>
           <label className="flex items-center gap-2">
             <input
@@ -421,7 +508,7 @@ export default function SettingsPanel() {
           )}
           {monitors.length <= 1 && settings.per_monitor && (
             <p className="text-xs text-zinc-500 ml-6">
-              Only 1 monitor detected — per-monitor has no effect.
+              Only 1 monitor detected, so this has no effect.
             </p>
           )}
         </section>
@@ -449,28 +536,11 @@ export default function SettingsPanel() {
           </section>
         )}
 
-        {/* Network */}
-        <section className={sectionClass}>
-          <h2 className={headingClass}>Network</h2>
-          <label className="flex items-center gap-2">
-            <input
-              type="checkbox"
-              checked={settings.wifi_only}
-              onChange={(e) => update("wifi_only", e.target.checked)}
-              className="h-4 w-4 rounded border-zinc-600 bg-zinc-800 text-blue-500 focus:ring-blue-500"
-            />
-            <span className="text-sm text-zinc-300">
-              Only rotate when connected to Wi-Fi
-            </span>
-            <span className="text-xs text-zinc-500">(coming soon)</span>
-          </label>
-        </section>
-
         {/* Save */}
         <button
           type="button"
           onClick={saveSettings}
-          disabled={!!queryFilterError || testResult.status === "zero"}
+          disabled={saving || !!queryFilterError || testResult.status === "zero"}
           className="w-full rounded bg-blue-600 px-4 py-2.5 font-medium text-white hover:bg-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:ring-offset-zinc-900 disabled:opacity-50 disabled:cursor-not-allowed"
         >
           {saved

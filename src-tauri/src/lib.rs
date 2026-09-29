@@ -31,6 +31,30 @@ pub struct MonitorInfo {
 struct AppState {
     settings: Arc<RwLock<Settings>>,
     engine_tx: engine::CommandTx,
+    /// Set when the settings file couldn't be read at startup
+    load_warning: std::sync::Mutex<Option<String>>,
+}
+
+/// The monitors as Tauri reports them, in physical pixels.
+pub fn monitor_infos(app: &tauri::AppHandle) -> Vec<MonitorInfo> {
+    app.available_monitors()
+        .map(|monitors| {
+            monitors
+                .into_iter()
+                .map(|m| {
+                    let size = m.size();
+                    let pos = m.position();
+                    MonitorInfo {
+                        width: size.width,
+                        height: size.height,
+                        x: pos.x,
+                        y: pos.y,
+                        scale_factor: m.scale_factor(),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn show_settings_window(app: &tauri::AppHandle) {
@@ -78,23 +102,28 @@ async fn save_settings(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     new_settings: Settings,
-) -> Result<(), AppError> {
-    // Refuse a filter the engine couldn't apply, rather than save it and fail
-    // every rotation after
-    stash::parse_query_filter(&new_settings.query_filter)?;
+) -> Result<Settings, AppError> {
+    // Clean up the URL, and refuse a filter the engine couldn't apply rather
+    // than save it and fail every rotation after
+    let new_settings = settings::prepare(new_settings)?;
     settings::save(&app, &new_settings)?;
-    *state.settings.write().await = new_settings;
+    // The unreadable file has now been replaced
+    *state
+        .load_warning
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    *state.settings.write().await = new_settings.clone();
     state
         .engine_tx
         .send(engine::Command::SettingsUpdated)
         .await
         .map_err(|e| AppError::Settings(e.to_string()))?;
-    Ok(())
+    Ok(new_settings)
 }
 
 #[tauri::command]
-async fn test_connection(url: String, api_key: String) -> Result<bool, AppError> {
-    stash::test_connection(&url, &api_key).await
+async fn test_connection(url: String, api_key: String) -> Result<(), AppError> {
+    stash::test_connection(&settings::normalize_stash_url(&url)?, &api_key).await
 }
 
 #[tauri::command]
@@ -124,48 +153,30 @@ async fn resume_rotation(state: tauri::State<'_, AppState>) -> Result<(), AppErr
         .map_err(|e| AppError::Settings(e.to_string()))
 }
 
-#[derive(serde::Serialize)]
-struct MonitorResolution {
-    width: u32,
-    height: u32,
-}
-
-#[tauri::command]
-async fn detect_monitor_resolution(app: tauri::AppHandle) -> Option<MonitorResolution> {
-    app.primary_monitor().ok().flatten().map(|monitor| {
-        let size = monitor.size();
-        MonitorResolution {
-            width: size.width,
-            height: size.height,
-        }
-    })
-}
-
 #[tauri::command]
 async fn detect_monitors(app: tauri::AppHandle) -> Vec<MonitorInfo> {
-    app.available_monitors()
-        .map(|monitors| {
-            monitors
-                .into_iter()
-                .map(|m| {
-                    let size = m.size();
-                    let pos = m.position();
-                    MonitorInfo {
-                        width: size.width,
-                        height: size.height,
-                        x: pos.x,
-                        y: pos.y,
-                        scale_factor: m.scale_factor(),
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    monitor_infos(&app)
 }
 
 #[tauri::command]
 async fn test_query(new_settings: Settings) -> Result<usize, AppError> {
-    stash::test_query(&new_settings).await
+    stash::test_query(&settings::prepare(new_settings)?).await
+}
+
+/// The settings window calls this once it has rendered, so the log (and the
+/// CI smoke test) can tell the window actually works.
+#[tauri::command]
+fn window_ready() {
+    log::info!("Settings window ready");
+}
+
+#[tauri::command]
+fn settings_load_warning(state: tauri::State<'_, AppState>) -> Option<String> {
+    state
+        .load_warning
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -195,20 +206,21 @@ pub fn run() {
             save_settings,
             test_connection,
             test_query,
-            detect_monitor_resolution,
             detect_monitors,
             next_wallpaper,
             pause_rotation,
             resume_rotation,
             get_autostart,
             set_autostart,
+            settings_load_warning,
+            window_ready,
         ])
         .setup(|app| {
             log::info!("StashPaper {} starting", app.package_info().version);
 
             // Load settings
-            let loaded = settings::load(app.handle())?;
-            let first_run = !settings::is_configured(&loaded);
+            let (loaded, load_warning) = settings::load(app.handle())?;
+            let show_settings = !settings::is_configured(&loaded) || load_warning.is_some();
             let shared_settings = Arc::new(RwLock::new(loaded));
 
             // Create engine channel
@@ -218,6 +230,7 @@ pub fn run() {
             app.manage(AppState {
                 settings: shared_settings.clone(),
                 engine_tx: tx.clone(),
+                load_warning: std::sync::Mutex::new(load_warning),
             });
             app.manage(tray::OpenUrls::default());
 
@@ -298,8 +311,8 @@ pub fn run() {
                 }
             });
 
-            // Show settings on first run
-            if first_run {
+            // Show settings on first run, or when the settings file was unreadable
+            if show_settings {
                 show_settings_window(app.handle());
             }
 

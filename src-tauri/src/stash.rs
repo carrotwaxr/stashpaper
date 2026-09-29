@@ -73,15 +73,39 @@ fn redirect_allowed(from: &reqwest::Url, to: &reqwest::Url) -> bool {
     (same_port && from.scheme() == to.scheme()) || upgrade
 }
 
+/// reqwest's own message stops at "error sending request for url (...)"; the
+/// cause (connection refused, DNS, TLS, timeout) is further down the chain.
+fn describe(e: &reqwest::Error) -> String {
+    use std::error::Error as _;
+    let mut text = e.to_string();
+    let mut source = e.source();
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        if !text.contains(&cause_text) {
+            text.push_str(": ");
+            text.push_str(&cause_text);
+        }
+        source = cause.source();
+    }
+    text
+}
+
 fn build_client(api_key: &str) -> Result<Client, AppError> {
     let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(
-        "ApiKey",
-        api_key
-            .trim()
-            .parse()
-            .map_err(|e: reqwest::header::InvalidHeaderValue| AppError::Stash(e.to_string()))?,
-    );
+    // Stash has no login out of the box; then there's no key to send
+    let api_key = api_key.trim();
+    if !api_key.is_empty() {
+        headers.insert(
+            "ApiKey",
+            api_key
+                .parse()
+                .map_err(|_: reqwest::header::InvalidHeaderValue| {
+                    AppError::Settings(
+                        "the API key has characters an HTTP header can't carry".into(),
+                    )
+                })?,
+        );
+    }
 
     let redirects = reqwest::redirect::Policy::custom(|attempt| {
         let allowed = attempt
@@ -103,14 +127,19 @@ fn build_client(api_key: &str) -> Result<Client, AppError> {
         .timeout(std::time::Duration::from_secs(30))
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
-        .map_err(|e| AppError::Stash(e.to_string()))
+        .map_err(|e| AppError::Stash(describe(&e)))
 }
 
 pub fn client_for(settings: &Settings) -> Result<Client, AppError> {
     build_client(&settings.api_key)
 }
 
-pub async fn test_connection(url: &str, api_key: &str) -> Result<bool, AppError> {
+/// Check that the server answers GraphQL with this key. Every failure is an
+/// error that says what went wrong, for the settings window to show.
+pub async fn test_connection(url: &str, api_key: &str) -> Result<(), AppError> {
+    if url.is_empty() {
+        return Err(AppError::Settings("enter the Server URL first".into()));
+    }
     let client = build_client(api_key)?;
 
     let body = GraphQLRequest {
@@ -118,14 +147,72 @@ pub async fn test_connection(url: &str, api_key: &str) -> Result<bool, AppError>
         variables: json!({}),
     };
 
+    let url = format!("{}/graphql", url.trim_end_matches('/'));
     let resp = client
-        .post(format!("{}/graphql", url.trim_end_matches('/')))
+        .post(&url)
         .json(&body)
         .send()
         .await
-        .map_err(|e| AppError::Stash(e.to_string()))?;
+        .map_err(|e| AppError::Stash(describe(&e)))?;
 
-    Ok(resp.status().is_success())
+    let status = resp.status();
+    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        return Err(auth_error(status));
+    }
+    let redirected_to = was_redirected(&url, resp.url());
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| AppError::Stash(describe(&e)))?;
+    let answer: Option<Value> = serde_json::from_str(&text).ok();
+
+    // Only Stash answers this query; a captive portal or another app's 200
+    // page doesn't
+    let is_stash = answer
+        .as_ref()
+        .and_then(|a| a.pointer("/data/systemStatus"))
+        .is_some_and(|s| !s.is_null());
+    if status.is_success() && is_stash {
+        return Ok(());
+    }
+    if let Some(to) = redirected_to {
+        return Err(redirect_error(&to));
+    }
+    if let Some(message) = answer
+        .as_ref()
+        .and_then(|a| a.pointer("/errors/0/message"))
+        .and_then(Value::as_str)
+    {
+        return Err(AppError::Stash(message.to_string()));
+    }
+    if !status.is_success() {
+        return Err(AppError::Stash(format!(
+            "the server returned HTTP {}",
+            status
+        )));
+    }
+    Err(AppError::Stash(
+        "the server answered, but not like Stash: check the Server URL".into(),
+    ))
+}
+
+/// Where a request ended up, if that's not where it was sent. Compared parsed,
+/// so case and default ports don't count as a redirect.
+fn was_redirected(sent: &str, landed: &reqwest::Url) -> Option<reqwest::Url> {
+    match reqwest::Url::parse(sent) {
+        Ok(sent) if sent == *landed => None,
+        _ => Some(landed.clone()),
+    }
+}
+
+/// A redirect turns the POST into a GET (except for 307/308), so a failure
+/// after one is best explained as "use the address it redirects to".
+fn redirect_error(to: &reqwest::Url) -> AppError {
+    AppError::Stash(format!(
+        "the server redirected to {}, use {} as the Server URL",
+        to,
+        to.origin().ascii_serialization()
+    ))
 }
 
 /// The user's query filter, split into the two `findImages` arguments.
@@ -177,11 +264,17 @@ pub fn parse_query_filter(raw: &str) -> Result<QueryFilter, AppError> {
 
 /// Build the `findImages` variables from the user's query filter, merging in
 /// pagination (per_page, page), the min_resolution filter and the random seed sort.
+///
+/// `random_seed` is Random mode's seed: it replaces no sort, "random" or an
+/// older "random_<seed>". `sort_seed` is for the other modes: it only replaces an
+/// explicit "random" sort, which Stash would otherwise reshuffle on every page
+/// request, so Sequential and Shuffle would repeat images.
 fn build_variables(
     settings: &Settings,
     per_page: usize,
     page: usize,
     random_seed: Option<u64>,
+    sort_seed: Option<u64>,
 ) -> Result<Value, AppError> {
     let QueryFilter {
         mut filter,
@@ -209,6 +302,10 @@ fn build_variables(
         if replace {
             filter.insert("sort".into(), json!(format!("random_{}", seed)));
         }
+    } else if let Some(seed) = sort_seed {
+        if filter.get("sort").and_then(Value::as_str) == Some("random") {
+            filter.insert("sort".into(), json!(format!("random_{}", seed)));
+        }
     }
 
     Ok(json!({
@@ -217,12 +314,19 @@ fn build_variables(
     }))
 }
 
+/// The same words fit a blank key and a wrong one, and point at where the key
+/// lives (Stash's settings) and where it goes (StashPaper's).
 fn auth_error(status: StatusCode) -> AppError {
     if status == StatusCode::FORBIDDEN {
-        AppError::Stash("access denied (HTTP 403), check the API key in Settings".into())
+        AppError::Stash(
+            "Stash refused access (HTTP 403): check the API key from Stash's \
+             Settings > Security"
+                .into(),
+        )
     } else {
         AppError::Stash(format!(
-            "the API key was rejected (HTTP {}), check it in Settings",
+            "Stash wants a valid API key (HTTP {}): copy it from Stash's \
+             Settings > Security into StashPaper's settings",
             status.as_u16()
         ))
     }
@@ -244,7 +348,7 @@ async fn find_images(
         })
         .send()
         .await
-        .map_err(|e| AppError::Stash(e.to_string()))?;
+        .map_err(|e| AppError::Stash(describe(&e)))?;
 
     let status = resp.status();
     if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
@@ -252,17 +356,13 @@ async fn find_images(
     }
     // A redirect turns the POST into a GET (except for 307/308), so a failure
     // after one is best explained as "use the address it redirects to"
-    let redirected_to = (resp.url().as_str() != url).then(|| resp.url().clone());
+    let redirected_to = was_redirected(&url, resp.url());
     let body = resp
         .text()
         .await
-        .map_err(|e| AppError::Stash(e.to_string()))?;
+        .map_err(|e| AppError::Stash(describe(&e)))?;
     match (parse_find_images(status, &body), redirected_to) {
-        (Err(_), Some(to)) => Err(AppError::Stash(format!(
-            "the server redirected to {}, use {} as the Server URL",
-            to,
-            to.origin().ascii_serialization()
-        ))),
+        (Err(_), Some(to)) => Err(redirect_error(&to)),
         (result, _) => result,
     }
 }
@@ -293,7 +393,12 @@ fn parse_find_images(status: StatusCode, body: &str) -> Result<FindImagesResult,
 
 /// Count the images the filter matches, fetching no image rows.
 pub async fn query_image_count(client: &Client, settings: &Settings) -> Result<usize, AppError> {
-    let result = find_images(client, settings, build_variables(settings, 0, 1, None)?).await?;
+    let result = find_images(
+        client,
+        settings,
+        build_variables(settings, 0, 1, None, None)?,
+    )
+    .await?;
     Ok(result.count)
 }
 
@@ -303,11 +408,12 @@ pub async fn fetch_image_at_page(
     settings: &Settings,
     page: usize,
     random_seed: Option<u64>,
+    sort_seed: Option<u64>,
 ) -> Result<(usize, Option<StashImage>), AppError> {
     let result = find_images(
         client,
         settings,
-        build_variables(settings, 1, page, random_seed)?,
+        build_variables(settings, 1, page, random_seed, sort_seed)?,
     )
     .await?;
     Ok((result.count, result.images.into_iter().next()))
@@ -366,7 +472,7 @@ pub async fn download_image(
         .get(image_url)
         .send()
         .await
-        .map_err(|e| AppError::Stash(e.to_string()))?;
+        .map_err(|e| AppError::Stash(describe(&e)))?;
 
     let status = resp.status();
     if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
@@ -397,7 +503,7 @@ pub async fn download_image(
     let bytes = resp
         .bytes()
         .await
-        .map_err(|e| AppError::Stash(e.to_string()))?;
+        .map_err(|e| AppError::Stash(describe(&e)))?;
 
     // Name the file by what the bytes are, not by what the server claims
     let ext = match image::guess_format(&bytes) {
@@ -513,7 +619,7 @@ mod tests {
             query_filter: "{}".into(),
             ..Settings::default()
         };
-        let vars = build_variables(&settings, 1, 5, None).unwrap();
+        let vars = build_variables(&settings, 1, 5, None, None).unwrap();
         assert_eq!(vars["filter"]["per_page"], 1);
         assert_eq!(vars["filter"]["page"], 5);
         assert!(vars["image_filter"].is_object());
@@ -534,7 +640,7 @@ mod tests {
             .into(),
             ..Settings::default()
         };
-        let vars = build_variables(&settings, 1, 3, None).unwrap();
+        let vars = build_variables(&settings, 1, 3, None, None).unwrap();
         // User's sort/direction preserved (no seed passed)
         assert_eq!(vars["filter"]["sort"], "random");
         assert_eq!(vars["filter"]["direction"], "DESC");
@@ -554,7 +660,7 @@ mod tests {
             query_filter: r#"{"image_filter": {"tags": {"value": ["wallpaper"], "modifier": "INCLUDES_ALL"}}}"#.into(),
             ..Settings::default()
         };
-        let vars = build_variables(&settings, 1, 1, None).unwrap();
+        let vars = build_variables(&settings, 1, 1, None, None).unwrap();
         assert!(vars["image_filter"]["tags"]["value"].is_array());
         assert_eq!(vars["filter"]["per_page"], 1);
     }
@@ -568,7 +674,7 @@ mod tests {
             min_resolution: MinResolution::FullHd1080,
             ..Settings::default()
         };
-        let vars = build_variables(&settings, 1, 1, None).unwrap();
+        let vars = build_variables(&settings, 1, 1, None, None).unwrap();
         assert_eq!(vars["image_filter"]["resolution"]["value"], "STANDARD_HD");
         assert_eq!(
             vars["image_filter"]["resolution"]["modifier"],
@@ -587,7 +693,7 @@ mod tests {
             min_resolution: MinResolution::Hd720,
             ..Settings::default()
         };
-        let vars = build_variables(&settings, 1, 1, None).unwrap();
+        let vars = build_variables(&settings, 1, 1, None, None).unwrap();
         // User's resolution filter preserved, not overridden by min_resolution
         assert_eq!(vars["image_filter"]["resolution"]["value"], "FOUR_K");
         assert_eq!(vars["image_filter"]["resolution"]["modifier"], "EQUALS");
@@ -601,7 +707,7 @@ mod tests {
             query_filter: "{}".into(),
             ..Settings::default()
         };
-        let vars = build_variables(&settings, 1, 1, Some(42)).unwrap();
+        let vars = build_variables(&settings, 1, 1, Some(42), None).unwrap();
         assert_eq!(vars["filter"]["sort"], "random_42");
     }
 
@@ -613,7 +719,7 @@ mod tests {
             query_filter: r#"{"filter": {"sort": "random"}}"#.into(),
             ..Settings::default()
         };
-        let vars = build_variables(&settings, 1, 1, Some(99)).unwrap();
+        let vars = build_variables(&settings, 1, 1, Some(99), None).unwrap();
         assert_eq!(vars["filter"]["sort"], "random_99");
     }
 
@@ -625,7 +731,7 @@ mod tests {
             query_filter: r#"{"filter": {"sort": "random_12345"}}"#.into(),
             ..Settings::default()
         };
-        let vars = build_variables(&settings, 1, 1, Some(99)).unwrap();
+        let vars = build_variables(&settings, 1, 1, Some(99), None).unwrap();
         assert_eq!(vars["filter"]["sort"], "random_99");
     }
 
@@ -637,7 +743,7 @@ mod tests {
             query_filter: r#"{"filter": {"sort": "rating"}}"#.into(),
             ..Settings::default()
         };
-        let vars = build_variables(&settings, 1, 1, Some(99)).unwrap();
+        let vars = build_variables(&settings, 1, 1, Some(99), None).unwrap();
         // User's non-random sort should be preserved
         assert_eq!(vars["filter"]["sort"], "rating");
     }
@@ -727,6 +833,16 @@ mod tests {
     }
 
     #[test]
+    fn test_case_and_default_ports_are_not_a_redirect() {
+        let landed = reqwest::Url::parse("http://desktop-ab12:9999/graphql").unwrap();
+        assert!(was_redirected("http://DESKTOP-AB12:9999/graphql", &landed).is_none());
+        let https = reqwest::Url::parse("https://stash.example.com/graphql").unwrap();
+        assert!(was_redirected("https://stash.example.com:443/graphql", &https).is_none());
+        let moved = reqwest::Url::parse("https://stash.example.com/graphql").unwrap();
+        assert!(was_redirected("http://stash.example.com/graphql", &moved).is_some());
+    }
+
+    #[test]
     fn test_parse_query_filter_ignores_a_byte_order_mark() {
         for raw in [
             "\u{feff}{\"filter\": {\"sort\": \"rating\"}}",
@@ -738,9 +854,30 @@ mod tests {
     }
 
     #[test]
+    fn test_sort_seed_fixes_an_explicit_random_sort_only() {
+        let with_sort = |sort: &str| {
+            let filter = if sort.is_empty() {
+                "{}".to_string()
+            } else {
+                format!(r#"{{"filter": {{"sort": "{}"}}}}"#, sort)
+            };
+            let settings = Settings {
+                query_filter: filter,
+                ..Settings::default()
+            };
+            build_variables(&settings, 1, 1, None, Some(77)).unwrap()["filter"]["sort"].clone()
+        };
+        assert_eq!(with_sort("random"), "random_77");
+        // no sort keeps Stash's stable default order; others are the user's
+        assert_eq!(with_sort(""), Value::Null);
+        assert_eq!(with_sort("rating"), "rating");
+        assert_eq!(with_sort("random_5"), "random_5");
+    }
+
+    #[test]
     fn test_build_variables_fails_on_unusable_filter() {
         let settings = settings_for("http://localhost:9999", r#"{"imagefilter": {}}"#);
-        assert!(build_variables(&settings, 1, 1, None).is_err());
+        assert!(build_variables(&settings, 1, 1, None, None).is_err());
     }
 
     #[test]
@@ -819,6 +956,96 @@ mod tests {
             assert!(
                 matches!(result.unwrap(), Download::Saved(p) if p.extension().unwrap() == "png")
             );
+        }
+
+        #[tokio::test]
+        async fn a_blank_key_sends_no_api_key_header() {
+            let server = MockServer::start().await;
+            serve(
+                &server,
+                "/img",
+                ResponseTemplate::new(200).set_body_raw(png_bytes(), "image/png"),
+            )
+            .await;
+            let dir = tempfile::tempdir().unwrap();
+            let client = build_client("  ").unwrap();
+            let url = format!("{}/img", server.uri());
+            download_image(&client, &url, dir.path(), 0).await.unwrap();
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].headers.get("apikey").is_none());
+        }
+
+        #[test]
+        fn a_key_that_cannot_be_a_header_is_a_settings_error() {
+            let err = build_client("abc\ndef").unwrap_err().to_string();
+            assert!(
+                err.contains("characters an HTTP header can't carry"),
+                "{err}"
+            );
+        }
+
+        async fn connection_to(
+            server: &MockServer,
+            response: ResponseTemplate,
+        ) -> Result<(), AppError> {
+            Mock::given(method("POST"))
+                .and(path("/graphql"))
+                .respond_with(response)
+                .mount(server)
+                .await;
+            test_connection(&server.uri(), "key").await
+        }
+
+        #[tokio::test]
+        async fn test_connection_says_what_went_wrong() {
+            let stash = serde_json::json!({"data": {"systemStatus": {"databaseSchema": 70}}});
+            let cases: Vec<(ResponseTemplate, Option<&str>)> = vec![
+                (ResponseTemplate::new(200).set_body_json(stash), None),
+                (ResponseTemplate::new(401), Some("wants a valid API key")),
+                (ResponseTemplate::new(403), Some("refused access")),
+                (
+                    ResponseTemplate::new(502).set_body_string("Bad Gateway"),
+                    Some("HTTP 502"),
+                ),
+                (
+                    ResponseTemplate::new(200)
+                        .set_body_raw(b"<html>wifi login</html>".to_vec(), "text/html"),
+                    Some("not like Stash"),
+                ),
+                (
+                    ResponseTemplate::new(422).set_body_json(serde_json::json!({
+                        "errors": [{"message": "unknown field"}], "data": null
+                    })),
+                    Some("unknown field"),
+                ),
+            ];
+            for (response, expected) in cases {
+                let server = MockServer::start().await;
+                let result = connection_to(&server, response).await;
+                match (result, expected) {
+                    (Ok(()), None) => {}
+                    (Err(e), Some(text)) => assert!(e.to_string().contains(text), "{e}"),
+                    (result, expected) => panic!("{result:?}, expected {expected:?}"),
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn test_connection_needs_a_url_and_names_the_network_cause() {
+            let err = test_connection("", "").await.unwrap_err().to_string();
+            assert!(err.contains("enter the Server URL"), "{err}");
+
+            // a port nothing listens on
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            let err = test_connection(&format!("http://127.0.0.1:{}", port), "")
+                .await
+                .unwrap_err()
+                .to_string()
+                .to_lowercase();
+            assert!(err.contains("refused"), "{err}");
         }
 
         #[tokio::test]
@@ -935,7 +1162,7 @@ mod tests {
             assert!(result
                 .unwrap_err()
                 .to_string()
-                .contains("API key was rejected"));
+                .contains("wants a valid API key"));
         }
 
         #[tokio::test]
@@ -1031,7 +1258,7 @@ mod tests {
             let settings = settings_for(&server.uri(), "{}");
             let client = client_for(&settings).unwrap();
             let err = query_image_count(&client, &settings).await.unwrap_err();
-            assert!(err.to_string().contains("API key was rejected"), "{err}");
+            assert!(err.to_string().contains("wants a valid API key"), "{err}");
         }
 
         #[tokio::test]
@@ -1060,7 +1287,7 @@ mod tests {
                 .await;
             let settings = settings_for(&server.uri(), "{}");
             let client = client_for(&settings).unwrap();
-            let (count, image) = fetch_image_at_page(&client, &settings, 2, Some(5))
+            let (count, image) = fetch_image_at_page(&client, &settings, 2, Some(5), None)
                 .await
                 .unwrap();
             assert_eq!(count, 7);

@@ -16,6 +16,7 @@ Run them all before committing. CI runs tests, clippy and the frontend build on 
 - The version lives in `src-tauri/Cargo.toml` and `package.json` only; `tauri.conf.json` has none on purpose. CI fails when the two differ.
 - Every Stash query goes through `build_variables()` in `stash.rs`, which merges pagination, the minimum-resolution filter and the random seed into the user's filter JSON. Don't assemble GraphQL variables anywhere else.
 - `src/lib/types.ts` mirrors the Rust `Settings` struct by hand. Change both together.
+- The API key is optional (Stash has no login by default): `is_configured` needs only a URL, and no `ApiKey` header is sent when the key is blank. `save_settings` stores the URL as `normalize_stash_url` returns it.
 - `Settings` is `#[serde(default)]` so old settings files keep loading. Add fields with defaults; don't rename or retype one without a migration.
 - Settings are a plain JSON file in the app config dir (`~/.config/com.stashpaper.app/settings.json` on Linux), mode 600 because it holds the API key. Engine state (last rotation time, rotation position) is `state.json` in the app data dir, owned by `schedule.rs`.
 - The tray menu is rebuilt from `TrayStatus` by `tray::refresh` whenever the engine's state changes. Change the menu there, not by holding menu item handles.

@@ -320,27 +320,6 @@ pub async fn run(mut rx: CommandRx, settings: Arc<RwLock<Settings>>, app: tauri:
     log::info!("Rotation engine stopped");
 }
 
-fn get_monitor_geometries(app: &tauri::AppHandle) -> Vec<crate::MonitorInfo> {
-    app.available_monitors()
-        .map(|monitors| {
-            monitors
-                .into_iter()
-                .map(|m| {
-                    let size = m.size();
-                    let pos = m.position();
-                    crate::MonitorInfo {
-                        width: size.width,
-                        height: size.height,
-                        x: pos.x,
-                        y: pos.y,
-                        scale_factor: m.scale_factor(),
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 /// Set wallpaper with Span mode (for composited multi-monitor images).
 fn set_wallpaper_span(path: &str) -> Result<(), AppError> {
     wallpaper::set_from_path(path).map_err(|e| AppError::Wallpaper(e.to_string()))?;
@@ -461,14 +440,21 @@ async fn download_batch(
                 Ok(paths)
             };
         }
-        let (fresh_count, image) =
-            match stash::fetch_image_at_page(client, settings, pick.page, pick.random_seed).await {
-                Ok(result) => result,
-                Err(e) => {
-                    discard(&paths);
-                    return Err(e);
-                }
-            };
+        let (fresh_count, image) = match stash::fetch_image_at_page(
+            client,
+            settings,
+            pick.page,
+            pick.random_seed,
+            Some(pick.sort_seed),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                discard(&paths);
+                return Err(e);
+            }
+        };
         count = fresh_count;
         *count_hint = Some(count);
         if count == 0 {
@@ -584,7 +570,7 @@ async fn rotate(
         .app_cache_dir()
         .map_err(|e: tauri::Error| AppError::Settings(e.to_string()))?;
 
-    let monitors = get_monitor_geometries(app_handle);
+    let monitors = crate::monitor_infos(app_handle);
     let per_monitor = s.per_monitor && monitors.len() > 1;
     let wanted = if per_monitor { monitors.len() } else { 1 };
 
@@ -832,6 +818,50 @@ mod tests {
         let (result, _dir) = run_batch(&server, &mut None, 1).await;
         let err = result.unwrap_err().to_string();
         assert!(err.contains("no usable image in 5 tries"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_explicit_random_sort_gets_one_fixed_seed() {
+        let server = stash_with_files().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(page(&server, 10, "/good"))
+            .mount(&server)
+            .await;
+        let settings = Settings {
+            query_filter: r#"{"filter": {"sort": "random"}}"#.into(),
+            ..settings_for(&server)
+        };
+        let client = stash::client_for(&settings).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        download_batch(
+            &client,
+            &settings,
+            &mut RotationState::new(),
+            &mut Some(10),
+            2,
+            dir.path(),
+        )
+        .await
+        .unwrap();
+
+        let sorts: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
+            .filter(|body| body["variables"]["filter"]["per_page"] == 1)
+            .map(|body| {
+                body["variables"]["filter"]["sort"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(sorts.len(), 2);
+        assert!(sorts[0].starts_with("random_"), "{sorts:?}");
+        assert_eq!(sorts[0], sorts[1], "the same order for every page");
     }
 
     #[tokio::test]
