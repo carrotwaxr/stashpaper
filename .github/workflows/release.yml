@@ -62,6 +62,8 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      # v1 only uploads to a release that's still a draft: if a platform job
+      # fails, re-run it before publishing the release
       - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
