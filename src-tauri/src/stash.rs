@@ -147,8 +147,9 @@ pub async fn test_connection(url: &str, api_key: &str) -> Result<(), AppError> {
         variables: json!({}),
     };
 
+    let url = format!("{}/graphql", url.trim_end_matches('/'));
     let resp = client
-        .post(format!("{}/graphql", url.trim_end_matches('/')))
+        .post(&url)
         .json(&body)
         .send()
         .await
@@ -158,13 +159,51 @@ pub async fn test_connection(url: &str, api_key: &str) -> Result<(), AppError> {
     if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
         return Err(auth_error(status));
     }
+    let redirected_to = (resp.url().as_str() != url).then(|| resp.url().clone());
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| AppError::Stash(describe(&e)))?;
+    let answer: Option<Value> = serde_json::from_str(&text).ok();
+
+    // Only Stash answers this query; a captive portal or another app's 200
+    // page doesn't
+    let is_stash = answer
+        .as_ref()
+        .and_then(|a| a.pointer("/data/systemStatus"))
+        .is_some_and(|s| !s.is_null());
+    if status.is_success() && is_stash {
+        return Ok(());
+    }
+    if let Some(to) = redirected_to {
+        return Err(redirect_error(&to));
+    }
+    if let Some(message) = answer
+        .as_ref()
+        .and_then(|a| a.pointer("/errors/0/message"))
+        .and_then(Value::as_str)
+    {
+        return Err(AppError::Stash(message.to_string()));
+    }
     if !status.is_success() {
         return Err(AppError::Stash(format!(
             "the server returned HTTP {}",
             status
         )));
     }
-    Ok(())
+    Err(AppError::Stash(
+        "the server answered, but not like Stash: check the Server URL".into(),
+    ))
+}
+
+/// A redirect turns the POST into a GET (except for 307/308), so a failure
+/// after one is best explained as "use the address it redirects to".
+fn redirect_error(to: &reqwest::Url) -> AppError {
+    AppError::Stash(format!(
+        "the server redirected to {}, use {} as the Server URL",
+        to,
+        to.origin().ascii_serialization()
+    ))
 }
 
 /// The user's query filter, split into the two `findImages` arguments.
@@ -314,11 +353,7 @@ async fn find_images(
         .await
         .map_err(|e| AppError::Stash(describe(&e)))?;
     match (parse_find_images(status, &body), redirected_to) {
-        (Err(_), Some(to)) => Err(AppError::Stash(format!(
-            "the server redirected to {}, use {} as the Server URL",
-            to,
-            to.origin().ascii_serialization()
-        ))),
+        (Err(_), Some(to)) => Err(redirect_error(&to)),
         (result, _) => result,
     }
 }
@@ -902,6 +937,96 @@ mod tests {
             assert!(
                 matches!(result.unwrap(), Download::Saved(p) if p.extension().unwrap() == "png")
             );
+        }
+
+        #[tokio::test]
+        async fn a_blank_key_sends_no_api_key_header() {
+            let server = MockServer::start().await;
+            serve(
+                &server,
+                "/img",
+                ResponseTemplate::new(200).set_body_raw(png_bytes(), "image/png"),
+            )
+            .await;
+            let dir = tempfile::tempdir().unwrap();
+            let client = build_client("  ").unwrap();
+            let url = format!("{}/img", server.uri());
+            download_image(&client, &url, dir.path(), 0).await.unwrap();
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].headers.get("apikey").is_none());
+        }
+
+        #[test]
+        fn a_key_that_cannot_be_a_header_is_a_settings_error() {
+            let err = build_client("abc\ndef").unwrap_err().to_string();
+            assert!(
+                err.contains("characters an HTTP header can't carry"),
+                "{err}"
+            );
+        }
+
+        async fn connection_to(
+            server: &MockServer,
+            response: ResponseTemplate,
+        ) -> Result<(), AppError> {
+            Mock::given(method("POST"))
+                .and(path("/graphql"))
+                .respond_with(response)
+                .mount(server)
+                .await;
+            test_connection(&server.uri(), "key").await
+        }
+
+        #[tokio::test]
+        async fn test_connection_says_what_went_wrong() {
+            let stash = serde_json::json!({"data": {"systemStatus": {"databaseSchema": 70}}});
+            let cases: Vec<(ResponseTemplate, Option<&str>)> = vec![
+                (ResponseTemplate::new(200).set_body_json(stash), None),
+                (ResponseTemplate::new(401), Some("wants a valid API key")),
+                (ResponseTemplate::new(403), Some("refused access")),
+                (
+                    ResponseTemplate::new(502).set_body_string("Bad Gateway"),
+                    Some("HTTP 502"),
+                ),
+                (
+                    ResponseTemplate::new(200)
+                        .set_body_raw(b"<html>wifi login</html>".to_vec(), "text/html"),
+                    Some("not like Stash"),
+                ),
+                (
+                    ResponseTemplate::new(422).set_body_json(serde_json::json!({
+                        "errors": [{"message": "unknown field"}], "data": null
+                    })),
+                    Some("unknown field"),
+                ),
+            ];
+            for (response, expected) in cases {
+                let server = MockServer::start().await;
+                let result = connection_to(&server, response).await;
+                match (result, expected) {
+                    (Ok(()), None) => {}
+                    (Err(e), Some(text)) => assert!(e.to_string().contains(text), "{e}"),
+                    (result, expected) => panic!("{result:?}, expected {expected:?}"),
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn test_connection_needs_a_url_and_names_the_network_cause() {
+            let err = test_connection("", "").await.unwrap_err().to_string();
+            assert!(err.contains("enter the Server URL"), "{err}");
+
+            // a port nothing listens on
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            let err = test_connection(&format!("http://127.0.0.1:{}", port), "")
+                .await
+                .unwrap_err()
+                .to_string()
+                .to_lowercase();
+            assert!(err.contains("refused"), "{err}");
         }
 
         #[tokio::test]

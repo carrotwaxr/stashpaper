@@ -821,6 +821,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_explicit_random_sort_gets_one_fixed_seed() {
+        let server = stash_with_files().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(page(&server, 10, "/good"))
+            .mount(&server)
+            .await;
+        let settings = Settings {
+            query_filter: r#"{"filter": {"sort": "random"}}"#.into(),
+            ..settings_for(&server)
+        };
+        let client = stash::client_for(&settings).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        download_batch(
+            &client,
+            &settings,
+            &mut RotationState::new(),
+            &mut Some(10),
+            2,
+            dir.path(),
+        )
+        .await
+        .unwrap();
+
+        let sorts: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|r| serde_json::from_slice::<serde_json::Value>(&r.body).ok())
+            .filter(|body| body["variables"]["filter"]["per_page"] == 1)
+            .map(|body| {
+                body["variables"]["filter"]["sort"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(sorts.len(), 2);
+        assert!(sorts[0].starts_with("random_"), "{sorts:?}");
+        assert_eq!(sorts[0], sorts[1], "the same order for every page");
+    }
+
+    #[tokio::test]
     async fn a_known_count_costs_one_request_per_image() {
         let server = stash_with_files().await;
         Mock::given(method("POST"))

@@ -125,12 +125,16 @@ fn load_from(path: &Path) -> Result<(Settings, Option<String>), AppError> {
     if !path.exists() {
         return Ok((Settings::default(), None));
     }
-    let contents = std::fs::read_to_string(path)?;
-    match serde_json::from_str(&contents) {
+    let bytes = std::fs::read(path)?;
+    // Editors like Notepad add a byte order mark; serde doesn't want it
+    let text = std::str::from_utf8(bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes))
+        .map_err(|e| e.to_string());
+    let parsed = text.and_then(|text| serde_json::from_str(text).map_err(|e| e.to_string()));
+    match parsed {
         Ok(settings) => Ok((settings, None)),
         Err(e) => {
             log::warn!("Failed to parse settings, using defaults: {}", e);
-            let warning = match back_up(path, &contents) {
+            let warning = match back_up(path, &bytes) {
                 Ok(backup) => format!(
                     "Your settings file couldn't be read ({}), so these are the defaults. \
                      The old file is saved as {}.",
@@ -153,12 +157,12 @@ fn load_from(path: &Path) -> Result<(Settings, Option<String>), AppError> {
 
 /// Keep an unreadable settings file next to the real one. An existing backup
 /// with different contents is left alone and this one gets a timestamped name.
-fn back_up(path: &Path, contents: &str) -> std::io::Result<PathBuf> {
+fn back_up(path: &Path, contents: &[u8]) -> std::io::Result<PathBuf> {
     let backup = path.with_extension("json.bak");
-    match std::fs::read_to_string(&backup) {
+    match std::fs::read(&backup) {
         Ok(existing) if existing == contents => return Ok(backup),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            write_private(&backup, contents.as_bytes())?;
+            write_private(&backup, contents)?;
             return Ok(backup);
         }
         _ => {}
@@ -168,7 +172,7 @@ fn back_up(path: &Path, contents: &str) -> std::io::Result<PathBuf> {
         .unwrap_or_default()
         .as_secs();
     let dated = path.with_extension(format!("{}.json.bak", secs));
-    write_private(&dated, contents.as_bytes())?;
+    write_private(&dated, contents)?;
     Ok(dated)
 }
 
@@ -203,6 +207,14 @@ fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     file.sync_all()?;
     drop(file);
     std::fs::rename(&tmp, path)
+}
+
+/// Settings as the window sent them, cleaned up and checked before they're
+/// saved or tested: the URL normalized, the filter one the engine can apply.
+pub fn prepare(mut settings: Settings) -> Result<Settings, AppError> {
+    settings.stash_url = normalize_stash_url(&settings.stash_url)?;
+    crate::stash::parse_query_filter(&settings.query_filter)?;
+    Ok(settings)
 }
 
 /// A Stash server URL is all it takes: the API key is only needed when Stash has
@@ -432,12 +444,68 @@ mod tests {
         std::fs::write(&path, b"{broken").unwrap();
         // a read-only config dir: the backup can't be written
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        if std::fs::write(dir.path().join("probe"), b"x").is_ok() {
+            // running as root, which ignores the mode
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
         let result = load_from(&path);
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
 
         let (settings, warning) = result.unwrap();
         assert!(settings.stash_url.is_empty());
         assert!(warning.unwrap().contains("couldn't be backed up"));
+    }
+
+    #[test]
+    fn test_a_bom_or_non_utf8_file_never_stops_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, b"\xEF\xBB\xBF{\"stash_url\": \"http://x:9999\"}").unwrap();
+        let (settings, warning) = load_from(&path).unwrap();
+        assert_eq!(settings.stash_url, "http://x:9999");
+        assert!(warning.is_none());
+
+        std::fs::write(&path, b"{\"stash_url\": \"caf\xE9\"}").unwrap();
+        let (settings, warning) = load_from(&path).unwrap();
+        assert!(settings.stash_url.is_empty());
+        assert!(warning.is_some());
+    }
+
+    #[test]
+    fn test_prepare_normalizes_the_url_and_checks_the_filter() {
+        let prepared = prepare(Settings {
+            stash_url: "http://host:9999/graphql".into(),
+            ..Settings::default()
+        })
+        .unwrap();
+        assert_eq!(prepared.stash_url, "http://host:9999");
+
+        assert!(prepare(Settings {
+            stash_url: "host:9999".into(),
+            ..Settings::default()
+        })
+        .is_err());
+        assert!(prepare(Settings {
+            query_filter: r#"{"imagefilter": {}}"#.into(),
+            ..Settings::default()
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn test_save_goes_through_a_temp_file_and_never_writes_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, b"{\"api_key\": \"old\"}").unwrap();
+        // something in the way of the temp file: writing in place would
+        // succeed, going through the temp file can't
+        let blocker = dir.path().join("settings.json.tmp");
+        std::fs::create_dir(&blocker).unwrap();
+        std::fs::write(blocker.join("x"), b"x").unwrap();
+
+        assert!(save_to(&path, &Settings::default()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"api_key\": \"old\"}");
     }
 
     #[test]

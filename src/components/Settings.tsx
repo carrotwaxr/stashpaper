@@ -97,6 +97,8 @@ export default function SettingsPanel() {
     invoke<string | null>("settings_load_warning")
       .then(setLoadWarning)
       .catch(() => {});
+    // Tells the log (and the CI smoke test) the window rendered
+    invoke("window_ready").catch(() => {});
   }, []);
 
   // Applies immediately: it's an OS setting, not part of settings.json

@@ -101,12 +101,11 @@ async fn get_settings(state: tauri::State<'_, AppState>) -> Result<Settings, App
 async fn save_settings(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
-    mut new_settings: Settings,
+    new_settings: Settings,
 ) -> Result<Settings, AppError> {
-    new_settings.stash_url = settings::normalize_stash_url(&new_settings.stash_url)?;
-    // Refuse a filter the engine couldn't apply, rather than save it and fail
-    // every rotation after
-    stash::parse_query_filter(&new_settings.query_filter)?;
+    // Clean up the URL, and refuse a filter the engine couldn't apply rather
+    // than save it and fail every rotation after
+    let new_settings = settings::prepare(new_settings)?;
     settings::save(&app, &new_settings)?;
     // The unreadable file has now been replaced
     *state
@@ -160,9 +159,15 @@ async fn detect_monitors(app: tauri::AppHandle) -> Vec<MonitorInfo> {
 }
 
 #[tauri::command]
-async fn test_query(mut new_settings: Settings) -> Result<usize, AppError> {
-    new_settings.stash_url = settings::normalize_stash_url(&new_settings.stash_url)?;
-    stash::test_query(&new_settings).await
+async fn test_query(new_settings: Settings) -> Result<usize, AppError> {
+    stash::test_query(&settings::prepare(new_settings)?).await
+}
+
+/// The settings window calls this once it has rendered, so the log (and the
+/// CI smoke test) can tell the window actually works.
+#[tauri::command]
+fn window_ready() {
+    log::info!("Settings window ready");
 }
 
 #[tauri::command]
@@ -208,6 +213,7 @@ pub fn run() {
             get_autostart,
             set_autostart,
             settings_load_warning,
+            window_ready,
         ])
         .setup(|app| {
             log::info!("StashPaper {} starting", app.package_info().version);
