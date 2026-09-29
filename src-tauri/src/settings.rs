@@ -130,19 +130,46 @@ fn load_from(path: &Path) -> Result<(Settings, Option<String>), AppError> {
         Ok(settings) => Ok((settings, None)),
         Err(e) => {
             log::warn!("Failed to parse settings, using defaults: {}", e);
-            let backup = path.with_extension("json.bak");
-            std::fs::copy(path, &backup)?;
-            Ok((
-                Settings::default(),
-                Some(format!(
+            let warning = match back_up(path, &contents) {
+                Ok(backup) => format!(
                     "Your settings file couldn't be read ({}), so these are the defaults. \
                      The old file is saved as {}.",
                     e,
                     backup.display()
-                )),
-            ))
+                ),
+                Err(backup_error) => {
+                    log::warn!("Couldn't back up the settings file: {}", backup_error);
+                    format!(
+                        "Your settings file couldn't be read ({}), so these are the defaults, \
+                         and it couldn't be backed up ({}). Saving will replace it.",
+                        e, backup_error
+                    )
+                }
+            };
+            Ok((Settings::default(), Some(warning)))
         }
     }
+}
+
+/// Keep an unreadable settings file next to the real one. An existing backup
+/// with different contents is left alone and this one gets a timestamped name.
+fn back_up(path: &Path, contents: &str) -> std::io::Result<PathBuf> {
+    let backup = path.with_extension("json.bak");
+    match std::fs::read_to_string(&backup) {
+        Ok(existing) if existing == contents => return Ok(backup),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            write_private(&backup, contents.as_bytes())?;
+            return Ok(backup);
+        }
+        _ => {}
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let dated = path.with_extension(format!("{}.json.bak", secs));
+    write_private(&dated, contents.as_bytes())?;
+    Ok(dated)
 }
 
 pub fn save(app: &tauri::AppHandle, settings: &Settings) -> Result<(), AppError> {
@@ -160,7 +187,9 @@ fn save_to(path: &Path, settings: &Settings) -> Result<(), AppError> {
 /// from the moment the file exists (it holds the API key).
 fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    let tmp = path.with_extension("json.tmp");
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
     let _ = std::fs::remove_file(&tmp);
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -368,6 +397,50 @@ mod tests {
     }
 
     #[test]
+    fn test_a_second_broken_file_doesnt_overwrite_the_first_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, b"{broken one").unwrap();
+        load_from(&path).unwrap();
+        std::fs::write(&path, b"{broken two").unwrap();
+        let (_, warning) = load_from(&path).unwrap();
+
+        assert_eq!(
+            std::fs::read(dir.path().join("settings.json.bak")).unwrap(),
+            b"{broken one"
+        );
+        let warning = warning.unwrap();
+        assert!(!warning.contains("settings.json.bak."), "{warning}");
+        let dated: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| {
+                name.starts_with("settings.")
+                    && name.ends_with(".json.bak")
+                    && name != "settings.json.bak"
+            })
+            .collect();
+        assert_eq!(dated.len(), 1, "{dated:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_failed_backup_still_starts_with_defaults() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, b"{broken").unwrap();
+        // a read-only config dir: the backup can't be written
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = load_from(&path);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let (settings, warning) = result.unwrap();
+        assert!(settings.stash_url.is_empty());
+        assert!(warning.unwrap().contains("couldn't be backed up"));
+    }
+
+    #[test]
     fn test_save_round_trips_and_leaves_no_temp_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
@@ -381,7 +454,7 @@ mod tests {
         let (loaded, warning) = load_from(&path).unwrap();
         assert!(warning.is_none());
         assert_eq!(loaded.api_key, "secret");
-        assert!(!path.with_extension("json.tmp").exists());
+        assert!(!dir.path().join("settings.json.tmp").exists());
     }
 
     #[cfg(unix)]

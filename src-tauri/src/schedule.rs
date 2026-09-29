@@ -84,9 +84,12 @@ impl SavedState {
 /// The settings that decide which image comes next. A saved position only
 /// applies while these are unchanged.
 pub fn selection_key(settings: &Settings) -> String {
+    // Normalized, so cleaning up an old saved URL doesn't count as a new server
+    let url = crate::settings::normalize_stash_url(&settings.stash_url)
+        .unwrap_or_else(|_| settings.stash_url.clone());
     format!(
         "{}|{:?}|{:?}|{}|{}",
-        settings.stash_url,
+        url,
         settings.rotation_mode,
         settings.min_resolution,
         settings.per_monitor,
@@ -209,6 +212,15 @@ mod tests {
         };
         assert_ne!(selection_key(&base), selection_key(&other_filter));
         assert_ne!(selection_key(&base), selection_key(&other_server));
+        let tidied = Settings {
+            stash_url: "http://localhost:9999".into(),
+            ..Settings::default()
+        };
+        let untidy = Settings {
+            stash_url: "http://localhost:9999/graphql".into(),
+            ..Settings::default()
+        };
+        assert_eq!(selection_key(&tidied), selection_key(&untidy));
         assert_eq!(selection_key(&base), selection_key(&other_interval));
     }
 

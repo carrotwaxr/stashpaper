@@ -32,7 +32,7 @@ struct AppState {
     settings: Arc<RwLock<Settings>>,
     engine_tx: engine::CommandTx,
     /// Set when the settings file couldn't be read at startup
-    load_warning: Option<String>,
+    load_warning: std::sync::Mutex<Option<String>>,
 }
 
 /// The monitors as Tauri reports them, in physical pixels.
@@ -108,6 +108,11 @@ async fn save_settings(
     // every rotation after
     stash::parse_query_filter(&new_settings.query_filter)?;
     settings::save(&app, &new_settings)?;
+    // The unreadable file has now been replaced
+    *state
+        .load_warning
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     *state.settings.write().await = new_settings.clone();
     state
         .engine_tx
@@ -162,7 +167,11 @@ async fn test_query(mut new_settings: Settings) -> Result<usize, AppError> {
 
 #[tauri::command]
 fn settings_load_warning(state: tauri::State<'_, AppState>) -> Option<String> {
-    state.load_warning.clone()
+    state
+        .load_warning
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -215,7 +224,7 @@ pub fn run() {
             app.manage(AppState {
                 settings: shared_settings.clone(),
                 engine_tx: tx.clone(),
-                load_warning,
+                load_warning: std::sync::Mutex::new(load_warning),
             });
             app.manage(tray::OpenUrls::default());
 

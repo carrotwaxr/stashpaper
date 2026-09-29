@@ -209,7 +209,7 @@ export default function SettingsPanel() {
   const randomSort = filterSort !== null && filterSort.startsWith("random");
   const modeNote =
     settings.rotation_mode === "random" && filterSort !== null && !randomSort
-      ? `Your filter sorts by "${filterSort}", so images follow that order rather than a random one.`
+      ? `Your filter sorts by "${filterSort}", so images follow that order. Remove the sort from the filter for a random order.`
       : settings.rotation_mode !== "random" && randomSort
         ? "Your filter sorts randomly. StashPaper fixes that order once, so this mode doesn't repeat images."
         : null;
@@ -252,7 +252,7 @@ export default function SettingsPanel() {
           </div>
           <div>
             <label htmlFor="api-key" className={labelClass}>
-              API Key
+              API Key (optional)
             </label>
             <input
               id="api-key"
@@ -268,18 +268,21 @@ export default function SettingsPanel() {
               type="button"
               onClick={testConnection}
               disabled={connection.state === "testing" || !settings.stash_url.trim()}
+              title={settings.stash_url.trim() ? undefined : "Enter the Server URL first"}
               className="rounded bg-zinc-700 px-4 py-2 text-sm font-medium text-zinc-100 hover:bg-zinc-600 disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {connection.state === "testing"
                 ? "Testing..."
                 : "Test Connection"}
             </button>
-            {connection.state === "connected" && (
-              <span className="text-sm text-green-400">Connected</span>
-            )}
-            {connection.state === "failed" && (
-              <span className="text-sm text-red-400">{connection.error}</span>
-            )}
+            <span role="status" className="min-w-0 text-sm">
+              {connection.state === "connected" && (
+                <span className="text-green-400">Connected</span>
+              )}
+              {connection.state === "failed" && (
+                <span className="text-red-400">{connection.error}</span>
+              )}
+            </span>
           </div>
         </section>
 
@@ -316,6 +319,7 @@ export default function SettingsPanel() {
                 testResult.status === "testing" ||
                 !settings.stash_url.trim()
               }
+              title={settings.stash_url.trim() ? undefined : "Enter the Server URL first"}
               className="rounded bg-zinc-700 px-4 py-2 text-sm font-medium text-zinc-100 hover:bg-zinc-600 disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {testResult.status === "testing"
@@ -396,7 +400,7 @@ export default function SettingsPanel() {
               </SelectWrapper>
             </div>
           </div>
-          {modeNote && <p className="text-xs text-zinc-500">{modeNote}</p>}
+          {modeNote && <p className="text-xs text-zinc-400">{modeNote}</p>}
         </section>
 
         {/* Display */}
@@ -447,7 +451,8 @@ export default function SettingsPanel() {
             <SelectWrapper>
               <select
                 id="fit-mode"
-                className={selectClass}
+                disabled={compositing}
+                className={`${selectClass} disabled:opacity-50`}
                 style={{ color: "#f4f4f5", backgroundColor: "#27272a" }}
                 value={settings.fit_mode}
                 onChange={(e) =>

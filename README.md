@@ -73,7 +73,7 @@ Open the `.dmg` and drag StashPaper to Applications.
 
 1. Launch StashPaper. It starts in the system tray
 2. Click the tray icon > **Settings**
-3. Enter your **Stash server URL** (e.g., `http://localhost:9999`). Add your **API key** only if your Stash has a login set up (Settings > Security in Stash); out of the box it doesn't.
+3. Enter your **Stash server URL** (e.g., `http://localhost:9999`). Add your **API key** only if your Stash has a login set up; out of the box it doesn't. The key is on Stash's **Settings > Security** page.
 4. Click **Test Connection** to verify
 5. Optionally add a **Query Filter** to select specific images (see below)
 6. Click **Test Query** to see how many images match

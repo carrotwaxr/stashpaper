@@ -266,12 +266,19 @@ fn build_variables(
     }))
 }
 
+/// The same words fit a blank key and a wrong one, and point at where the key
+/// lives (Stash's settings) and where it goes (StashPaper's).
 fn auth_error(status: StatusCode) -> AppError {
     if status == StatusCode::FORBIDDEN {
-        AppError::Stash("access denied (HTTP 403), check the API key in Settings".into())
+        AppError::Stash(
+            "Stash refused access (HTTP 403): check the API key from Stash's \
+             Settings > Security"
+                .into(),
+        )
     } else {
         AppError::Stash(format!(
-            "the API key was rejected (HTTP {}), check it in Settings",
+            "Stash wants a valid API key (HTTP {}): copy it from Stash's \
+             Settings > Security into StashPaper's settings",
             status.as_u16()
         ))
     }
@@ -1011,7 +1018,7 @@ mod tests {
             assert!(result
                 .unwrap_err()
                 .to_string()
-                .contains("API key was rejected"));
+                .contains("wants a valid API key"));
         }
 
         #[tokio::test]
@@ -1107,7 +1114,7 @@ mod tests {
             let settings = settings_for(&server.uri(), "{}");
             let client = client_for(&settings).unwrap();
             let err = query_image_count(&client, &settings).await.unwrap_err();
-            assert!(err.to_string().contains("API key was rejected"), "{err}");
+            assert!(err.to_string().contains("wants a valid API key"), "{err}");
         }
 
         #[tokio::test]
