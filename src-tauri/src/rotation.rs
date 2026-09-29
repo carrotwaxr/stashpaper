@@ -1,6 +1,7 @@
 use crate::settings::RotationMode;
 use rand::seq::SliceRandom;
 use rand::RngExt;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RotationResult {
@@ -18,7 +19,34 @@ pub struct RotationState {
     random_page: usize,
 }
 
+/// The part of `RotationState` saved across restarts. The shuffle order isn't
+/// saved: it can be large, and a fresh shuffle is still no-repeat.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RotationSnapshot {
+    pub current_index: usize,
+    pub random_seed: Option<u64>,
+    pub random_page: usize,
+}
+
 impl RotationState {
+    pub fn snapshot(&self) -> RotationSnapshot {
+        RotationSnapshot {
+            current_index: self.current_index,
+            random_seed: self.random_seed,
+            random_page: self.random_page,
+        }
+    }
+
+    pub fn from_snapshot(snapshot: RotationSnapshot) -> Self {
+        Self {
+            current_index: snapshot.current_index,
+            random_seed: snapshot.random_seed,
+            random_page: snapshot.random_page,
+            ..Self::new()
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             current_index: 0,
@@ -276,5 +304,32 @@ mod tests {
         let r = state.select_next(RotationMode::Random, 10).unwrap();
         assert!(r.random_seed.is_some());
         assert_eq!(r.page, 1);
+    }
+
+    #[test]
+    fn test_restored_sequential_continues_where_it_stopped() {
+        let mut state = RotationState::new();
+        for _ in 0..3 {
+            state.select_next(RotationMode::Sequential, 10);
+        }
+        let mut restored = RotationState::from_snapshot(state.snapshot());
+        assert_eq!(
+            restored
+                .select_next(RotationMode::Sequential, 10)
+                .unwrap()
+                .page,
+            4
+        );
+    }
+
+    #[test]
+    fn test_restored_random_keeps_its_seed_and_page() {
+        let mut state = RotationState::new();
+        let first = state.select_next(RotationMode::Random, 10).unwrap();
+        state.select_next(RotationMode::Random, 10);
+        let mut restored = RotationState::from_snapshot(state.snapshot());
+        let next = restored.select_next(RotationMode::Random, 10).unwrap();
+        assert_eq!(next.random_seed, first.random_seed);
+        assert_eq!(next.page, 3);
     }
 }

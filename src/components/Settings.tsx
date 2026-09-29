@@ -65,6 +65,10 @@ export default function SettingsPanel() {
   const [saved, setSaved] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [monitors, setMonitors] = useState<MonitorInfo[]>([]);
+  // null until we know; stays null if the platform can't report it
+  const [autostart, setAutostart] = useState<boolean | null>(null);
+  const [autostartError, setAutostartError] = useState<string | null>(null);
+  const [autostartBusy, setAutostartBusy] = useState(false);
   const [testResult, setTestResult] = useState<TestQueryResult>({
     status: "idle",
   });
@@ -80,7 +84,26 @@ export default function SettingsPanel() {
     invoke<MonitorInfo[]>("detect_monitors")
       .then(setMonitors)
       .catch(() => {});
+    invoke<boolean>("get_autostart")
+      .then(setAutostart)
+      .catch((err) =>
+        setAutostartError(`Couldn't check start at login: ${String(err)}`),
+      );
   }, []);
+
+  // Applies immediately: it's an OS setting, not part of settings.json
+  async function toggleAutostart(enabled: boolean) {
+    setAutostartError(null);
+    setAutostartBusy(true);
+    try {
+      await invoke("set_autostart", { enabled });
+      setAutostart(enabled);
+    } catch (err) {
+      setAutostartError(`Couldn't change start at login: ${String(err)}`);
+    } finally {
+      setAutostartBusy(false);
+    }
+  }
 
   function update<K extends keyof Settings>(key: K, value: Settings[K]) {
     setSettings((prev) => ({ ...prev, [key]: value }));
@@ -402,6 +425,29 @@ export default function SettingsPanel() {
             </p>
           )}
         </section>
+
+        {/* Startup */}
+        {(autostart !== null || autostartError) && (
+          <section className={sectionClass}>
+            <h2 className={headingClass}>Startup</h2>
+            {autostart !== null && (
+              <label className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={autostart}
+                  disabled={autostartBusy}
+                  onChange={(e) => toggleAutostart(e.target.checked)}
+                  className="h-4 w-4 rounded border-zinc-600 bg-zinc-800 text-blue-500 focus:ring-blue-500"
+                />
+                <span className="text-sm text-zinc-300">
+                  Start StashPaper in the tray when I log in
+                </span>
+                <span className="text-xs text-zinc-500">(applies right away)</span>
+              </label>
+            )}
+            {autostartError && <p className="text-xs text-red-400">{autostartError}</p>}
+          </section>
+        )}
 
         {/* Network */}
         <section className={sectionClass}>

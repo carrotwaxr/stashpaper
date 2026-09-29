@@ -1,14 +1,17 @@
 use crate::error::AppError;
 use crate::rotation::RotationState;
+use crate::schedule;
 use crate::settings::Settings;
 use crate::stash;
+use crate::tray::TrayStatus;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 use tauri::Manager;
 use tokio::sync::{mpsc, RwLock};
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Command {
     Next,
     Pause,
@@ -24,77 +27,297 @@ pub fn create_channel() -> (CommandTx, CommandRx) {
     mpsc::channel(32)
 }
 
-pub async fn run(mut rx: CommandRx, settings: Arc<RwLock<Settings>>, app_handle: tauri::AppHandle) {
-    let mut paused = false;
-    let mut rotation_state = RotationState::new();
-    let mut count_hint: Option<usize> = None;
-    // The file the last successful rotation put on the desktop
-    let mut current: Option<PathBuf> = None;
+/// How often the loop rechecks the wall clock while waiting. Sleeps are capped
+/// at this so time spent suspended counts toward the interval.
+const POLL: Duration = Duration::from_secs(60);
+
+/// What the engine loop does next.
+#[derive(Debug, PartialEq)]
+enum Step {
+    Rotate,
+    Wait(Duration),
+}
+
+/// Everything the engine tracks between rotations.
+struct Engine {
+    rotation: RotationState,
+    count_hint: Option<usize>,
+    last_success: Option<SystemTime>,
+    last_failure: Option<SystemTime>,
+    failures: u32,
+    status: TrayStatus,
+    state_path: Option<PathBuf>,
+    /// `schedule::selection_key` of the settings the rotation position belongs to
+    selection_key: String,
+    /// The file the last successful rotation put on the desktop
+    current: Option<PathBuf>,
+    /// The images on the desktop, for "Open in Stash"
+    shown: Vec<schedule::ShownImage>,
+    /// The local date the tray was last drawn on, so "Changed at 14:05" can
+    /// become "yesterday at 14:05" after midnight
+    refreshed_on: Option<chrono::NaiveDate>,
+    /// The status changed outside a rotation (e.g. a clock correction)
+    needs_refresh: bool,
+}
+
+/// "Open in Stash" entries for the images on the desktop.
+fn image_url(stash_url: &str, id: &str) -> String {
+    format!("{}/images/{}", stash_url.trim_end_matches('/'), id)
+}
+
+/// "Open in Stash" entries for the images on the desktop. State saved before
+/// images kept their URL falls back to the current server.
+fn open_items(stash_url: &str, shown: &[schedule::ShownImage]) -> Vec<crate::tray::OpenItem> {
+    shown
+        .iter()
+        .map(|image| crate::tray::OpenItem {
+            label: image.label.clone(),
+            url: if image.url.is_empty() {
+                image_url(stash_url, &image.id)
+            } else {
+                image.url.clone()
+            },
+        })
+        .collect()
+}
+
+impl Engine {
+    fn restore(app: &tauri::AppHandle, settings: &Settings) -> Self {
+        let state_path = match app.path().app_data_dir() {
+            Ok(dir) => Some(schedule::state_path(&dir)),
+            Err(e) => {
+                log::warn!("No app data dir, so rotation state won't be saved: {}", e);
+                None
+            }
+        };
+        let saved = state_path
+            .as_deref()
+            .map(schedule::load)
+            .unwrap_or_default();
+        Self::from_saved(saved, settings, state_path)
+    }
+
+    fn from_saved(
+        saved: schedule::SavedState,
+        settings: &Settings,
+        state_path: Option<PathBuf>,
+    ) -> Self {
+        // A saved position only means something for the settings it came from
+        let selection_key = schedule::selection_key(settings);
+        let rotation = if saved.selection_key == selection_key {
+            RotationState::from_snapshot(saved.rotation.clone())
+        } else {
+            RotationState::new()
+        };
+        let last_success = saved.last_rotated_time();
+
+        Self {
+            rotation,
+            count_hint: None,
+            last_success,
+            last_failure: None,
+            failures: 0,
+            status: TrayStatus {
+                configured: crate::settings::is_configured(settings),
+                paused: saved.paused,
+                last_changed: last_success,
+                open: open_items(&settings.stash_url, &saved.shown),
+                ..TrayStatus::default()
+            },
+            state_path,
+            selection_key,
+            current: saved.current_wallpaper,
+            shown: saved.shown,
+            refreshed_on: None,
+            needs_refresh: false,
+        }
+    }
+
+    /// Decide what the loop does now. Waits never exceed `POLL`, so the next
+    /// decision rechecks the wall clock (suspended time counts).
+    fn next_step(&mut self, now: SystemTime, interval: Duration) -> Step {
+        // A clock set backwards leaves these in the future, which would push
+        // the next rotation out by however far the clock moved
+        if self.last_success.is_some_and(|t| t > now) {
+            self.last_success = Some(now);
+            self.status.last_changed = Some(now);
+            self.needs_refresh = true;
+        }
+        if self.last_failure.is_some_and(|t| t > now) {
+            self.last_failure = Some(now);
+            self.status.retry_at = Some(now + schedule::retry_delay(self.failures, interval));
+            self.needs_refresh = true;
+        }
+        if !self.status.configured || self.status.paused {
+            return Step::Wait(POLL);
+        }
+        let wait = schedule::time_until_due(
+            now,
+            self.last_success,
+            self.last_failure,
+            self.failures,
+            interval,
+        );
+        if wait.is_zero() {
+            Step::Rotate
+        } else {
+            Step::Wait(wait.min(POLL))
+        }
+    }
+
+    /// Update the engine after a rotation attempt that started at `now`.
+    fn record(
+        &mut self,
+        now: SystemTime,
+        result: Result<(PathBuf, Vec<schedule::ShownImage>), AppError>,
+        settings: &Settings,
+    ) {
+        match result {
+            Ok((wallpaper_path, shown)) => {
+                self.current = Some(wallpaper_path);
+                self.failures = 0;
+                self.last_failure = None;
+                self.last_success = Some(now);
+                self.status.error = None;
+                self.status.retry_at = None;
+                self.status.last_changed = Some(now);
+                self.status.open = open_items(&settings.stash_url, &shown);
+                self.shown = shown;
+            }
+            Err(e) => {
+                self.failures += 1;
+                self.last_failure = Some(now);
+                self.status.error = Some(e.to_string());
+                self.status.retry_at = Some(
+                    now + schedule::retry_delay(self.failures, settings.interval.to_duration()),
+                );
+            }
+        }
+    }
+
+    /// After a settings save: forget the rotation position if the settings that
+    /// pick images changed, and give a failing rotation a fresh start either way.
+    fn settings_changed(&mut self, settings: &Settings) {
+        let key = schedule::selection_key(settings);
+        if key != self.selection_key {
+            self.rotation.reset();
+            self.count_hint = None;
+            self.selection_key = key;
+        }
+        self.failures = 0;
+        self.last_failure = None;
+        self.status.configured = crate::settings::is_configured(settings);
+        if !self.status.configured {
+            // Nothing will rotate until it is set up again, so an old error
+            // would only linger
+            self.status.error = None;
+            self.status.retry_at = None;
+        }
+    }
+
+    fn refresh_tray(&mut self, app: &tauri::AppHandle) {
+        crate::tray::refresh(app, &self.status);
+        self.refreshed_on = Some(chrono::Local::now().date_naive());
+        self.needs_refresh = false;
+    }
+
+    fn set_paused(&mut self, paused: bool, app: &tauri::AppHandle) {
+        self.status.paused = paused;
+        self.save();
+        self.refresh_tray(app);
+    }
+
+    async fn rotate_and_record(
+        &mut self,
+        settings: &Arc<RwLock<Settings>>,
+        app: &tauri::AppHandle,
+    ) {
+        let s = settings.read().await.clone();
+        let result = rotate(
+            &s,
+            &mut self.rotation,
+            &mut self.count_hint,
+            self.current.as_deref(),
+            app,
+        )
+        .await;
+        match &result {
+            Ok(_) => log::info!("Wallpaper changed"),
+            Err(e) => log::error!("Rotation failed: {}", e),
+        }
+        let succeeded = result.is_ok();
+        // Timed from when the attempt ended: a request that hung for 30s
+        // shouldn't use up the 30s retry delay
+        self.record(SystemTime::now(), result, &s);
+        if succeeded {
+            self.save();
+        }
+        self.refresh_tray(app);
+    }
+
+    fn save(&self) {
+        let Some(path) = &self.state_path else {
+            return;
+        };
+        let state = schedule::SavedState {
+            last_rotated: self.last_success.map(schedule::unix_secs),
+            selection_key: self.selection_key.clone(),
+            rotation: self.rotation.snapshot(),
+            current_wallpaper: self.current.clone(),
+            shown: self.shown.clone(),
+            paused: self.status.paused,
+        };
+        if let Err(e) = schedule::save(path, &state) {
+            log::warn!("Couldn't save the rotation state: {}", e);
+        }
+    }
+}
+
+pub async fn run(mut rx: CommandRx, settings: Arc<RwLock<Settings>>, app: tauri::AppHandle) {
+    let mut engine = Engine::restore(&app, &*settings.read().await);
+    engine.refresh_tray(&app);
 
     loop {
-        let interval = {
-            let s = settings.read().await;
-            if !crate::settings::is_configured(&s) {
-                drop(s);
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let interval = settings.read().await.interval.to_duration();
+        let step = engine.next_step(SystemTime::now(), interval);
+        if engine.needs_refresh || engine.refreshed_on != Some(chrono::Local::now().date_naive()) {
+            engine.refresh_tray(&app);
+        }
+        let wait = match step {
+            Step::Rotate => {
+                engine.rotate_and_record(&settings, &app).await;
                 continue;
             }
-            s.interval.to_duration()
+            Step::Wait(wait) => wait,
         };
 
         tokio::select! {
             cmd = rx.recv() => {
                 match cmd {
                     Some(Command::Next) => {
-                        do_rotate(&settings, &mut rotation_state, &mut count_hint, &mut current, &app_handle).await;
+                        if engine.status.configured {
+                            engine.rotate_and_record(&settings, &app).await;
+                        }
                     }
-                    Some(Command::Pause) => {
-                        paused = true;
-                    }
-                    Some(Command::Resume) => {
-                        paused = false;
-                    }
+                    Some(Command::Pause) => engine.set_paused(true, &app),
+                    Some(Command::Resume) => engine.set_paused(false, &app),
                     Some(Command::SettingsUpdated) => {
-                        rotation_state.reset();
-                        count_hint = None;
-                        // Immediately rotate with new settings
-                        do_rotate(&settings, &mut rotation_state, &mut count_hint, &mut current, &app_handle).await;
+                        engine.settings_changed(&*settings.read().await);
+                        // Show the new settings at work right away
+                        if engine.status.configured {
+                            engine.rotate_and_record(&settings, &app).await;
+                        } else {
+                            engine.refresh_tray(&app);
+                        }
                     }
                     Some(Command::Quit) | None => break,
                 }
             }
-            _ = tokio::time::sleep(interval), if !paused => {
-                do_rotate(&settings, &mut rotation_state, &mut count_hint, &mut current, &app_handle).await;
-            }
+            // Wake up to recheck the wall clock; next_step decides
+            _ = tokio::time::sleep(wait) => {}
         }
     }
-}
-
-async fn do_rotate(
-    settings: &Arc<RwLock<Settings>>,
-    rotation_state: &mut RotationState,
-    count_hint: &mut Option<usize>,
-    current: &mut Option<PathBuf>,
-    app_handle: &tauri::AppHandle,
-) {
-    match rotate(
-        settings,
-        rotation_state,
-        count_hint,
-        current.as_deref(),
-        app_handle,
-    )
-    .await
-    {
-        Ok(path) => {
-            *current = Some(path);
-            crate::update_tray_icon(app_handle, false, None);
-        }
-        Err(e) => {
-            eprintln!("[StashPaper] Rotation error: {}", e);
-            crate::update_tray_icon(app_handle, true, Some(&e.to_string()));
-        }
-    }
+    log::info!("Rotation engine stopped");
 }
 
 fn get_monitor_geometries(app: &tauri::AppHandle) -> Vec<crate::MonitorInfo> {
@@ -152,7 +375,7 @@ fn set_wallpaper_span(path: &str) -> Result<(), AppError> {
 /// recognize, but by then the image itself is set, so that's not a failed rotation.
 fn set_mode_or_log(mode: wallpaper::Mode) {
     if let Err(e) = wallpaper::set_mode(mode) {
-        eprintln!("[StashPaper] Couldn't set the fit mode: {}", e);
+        log::warn!("Couldn't set the fit mode: {}", e);
     }
 }
 
@@ -161,7 +384,7 @@ const MAX_SKIPS: usize = 5;
 
 /// Delete files a failed rotation downloaded. They never reached the desktop, and
 /// nothing else would clean them up while rotations keep failing.
-fn discard(paths: &[PathBuf]) {
+fn discard(paths: &[impl AsRef<Path>]) {
     for path in paths {
         let _ = std::fs::remove_file(path);
     }
@@ -179,6 +402,19 @@ fn no_usable_image(skipped: &[String]) -> AppError {
     ))
 }
 
+/// One downloaded image and its Stash id.
+#[derive(Debug)]
+struct Picked {
+    path: PathBuf,
+    id: String,
+}
+
+impl AsRef<Path> for Picked {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
 /// Pick and download `wanted` images, skipping any a desktop can't show.
 /// `count_hint` carries the library size between rotations, so a rotation
 /// normally costs one GraphQL request per image instead of two. A page is tried
@@ -190,7 +426,7 @@ async fn download_batch(
     count_hint: &mut Option<usize>,
     wanted: usize,
     cache_dir: &Path,
-) -> Result<Vec<PathBuf>, AppError> {
+) -> Result<Vec<Picked>, AppError> {
     let mut count = match *count_hint {
         Some(count) => count,
         None => stash::query_image_count(client, settings).await?,
@@ -240,7 +476,11 @@ async fn download_batch(
             discard(&paths);
             return Err(no_images());
         }
-        let outcome = match image.and_then(|image| image.paths.image) {
+        let (id, url) = match image {
+            Some(image) => (image.id, image.paths.image),
+            None => (String::new(), None),
+        };
+        let outcome = match url {
             Some(url) => match stash::download_image(client, &url, cache_dir, paths.len()).await {
                 Ok(outcome) => outcome,
                 Err(e) => {
@@ -256,9 +496,9 @@ async fn download_batch(
         };
 
         match outcome {
-            stash::Download::Saved(path) => paths.push(path),
+            stash::Download::Saved(path) => paths.push(Picked { path, id }),
             stash::Download::Unusable(reason) => {
-                eprintln!("[StashPaper] Skipping image: {}", reason);
+                log::warn!("Skipping image {}: {}", id, reason);
                 skipped.push(reason);
                 if skipped.len() >= MAX_SKIPS.min(count) {
                     discard(&paths);
@@ -329,15 +569,15 @@ fn apply_wallpaper(
     }
 }
 
+/// Run one rotation. Returns the file now on the desktop and the images on it.
 async fn rotate(
-    settings: &Arc<RwLock<Settings>>,
+    s: &Settings,
     rotation_state: &mut RotationState,
     count_hint: &mut Option<usize>,
     current: Option<&Path>,
     app_handle: &tauri::AppHandle,
-) -> Result<PathBuf, AppError> {
-    let s = settings.read().await.clone();
-    let client = stash::client_for(&s)?;
+) -> Result<(PathBuf, Vec<schedule::ShownImage>), AppError> {
+    let client = stash::client_for(s)?;
 
     let cache_dir = app_handle
         .path()
@@ -348,8 +588,22 @@ async fn rotate(
     let per_monitor = s.per_monitor && monitors.len() > 1;
     let wanted = if per_monitor { monitors.len() } else { 1 };
 
-    let images =
-        download_batch(&client, &s, rotation_state, count_hint, wanted, &cache_dir).await?;
+    let picked = download_batch(&client, s, rotation_state, count_hint, wanted, &cache_dir).await?;
+    let shown: Vec<schedule::ShownImage> = picked
+        .iter()
+        .enumerate()
+        .map(|(index, p)| schedule::ShownImage {
+            id: p.id.clone(),
+            url: image_url(&s.stash_url, &p.id),
+            label: match monitors.get(index) {
+                Some(m) if per_monitor => {
+                    format!("Monitor {} ({}x{})", index + 1, m.width, m.height)
+                }
+                _ => String::new(),
+            },
+        })
+        .collect();
+    let images: Vec<PathBuf> = picked.into_iter().map(|p| p.path).collect();
 
     let geoms: Vec<crate::compositor::MonitorGeometry> = monitors
         .iter()
@@ -360,19 +614,30 @@ async fn rotate(
             height: m.height,
         })
         .collect();
-    apply_wallpaper(
-        &images,
-        per_monitor.then_some(geoms.as_slice()),
-        &cache_dir,
-        current,
-        |path, spanned| {
-            if spanned {
-                set_wallpaper_span(path)
-            } else {
-                set_wallpaper(path, &s)
-            }
-        },
-    )
+
+    // Compositing, the wallpaper tools and file deletes all block, so keep them
+    // off the async runtime
+    let settings = s.clone();
+    let current = current.map(Path::to_path_buf);
+    let wallpaper_path = tokio::task::spawn_blocking(move || {
+        apply_wallpaper(
+            &images,
+            per_monitor.then_some(geoms.as_slice()),
+            &cache_dir,
+            current.as_deref(),
+            |path, spanned| {
+                if spanned {
+                    set_wallpaper_span(path)
+                } else {
+                    set_wallpaper(path, &settings)
+                }
+            },
+        )
+    })
+    .await
+    .map_err(|e| AppError::Wallpaper(e.to_string()))??;
+
+    Ok((wallpaper_path, shown))
 }
 
 fn set_wallpaper(path: &str, settings: &Settings) -> Result<(), AppError> {
@@ -441,9 +706,13 @@ mod tests {
 
     /// A findImages response whose one image is served from `at` on `server`.
     fn page(server: &MockServer, count: usize, at: &str) -> ResponseTemplate {
+        page_with_id(server, count, at, "1")
+    }
+
+    fn page_with_id(server: &MockServer, count: usize, at: &str, id: &str) -> ResponseTemplate {
         ResponseTemplate::new(200).set_body_json(json!({
             "data": {"findImages": {"count": count, "images": [
-                {"id": "1", "paths": {"image": format!("{}{}", server.uri(), at)}}
+                {"id": id, "paths": {"image": format!("{}{}", server.uri(), at)}}
             ]}}
         }))
     }
@@ -495,7 +764,8 @@ mod tests {
             Mock::given(method("POST"))
                 .and(path("/graphql"))
                 .and(page_query(i + 1))
-                .respond_with(page(server, count, at))
+                // the image id is the page number, to check ids line up
+                .respond_with(page_with_id(server, count, at, &(i + 1).to_string()))
                 .expect(1)
                 .mount(server)
                 .await;
@@ -506,7 +776,7 @@ mod tests {
         server: &MockServer,
         count_hint: &mut Option<usize>,
         wanted: usize,
-    ) -> (Result<Vec<PathBuf>, AppError>, tempfile::TempDir) {
+    ) -> (Result<Vec<Picked>, AppError>, tempfile::TempDir) {
         let settings = settings_for(server);
         let client = stash::client_for(&settings).unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -532,7 +802,8 @@ mod tests {
         let (result, _dir) = run_batch(&server, &mut count_hint, 1).await;
         let paths = result.unwrap();
         assert_eq!(paths.len(), 1);
-        assert_eq!(std::fs::read(&paths[0]).unwrap(), png_bytes());
+        assert_eq!(std::fs::read(&paths[0].path).unwrap(), png_bytes());
+        assert_eq!(paths[0].id, "2", "the image from page 2");
         assert_eq!(count_hint, Some(3));
     }
 
@@ -587,7 +858,7 @@ mod tests {
         let names: Vec<String> = result
             .unwrap()
             .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .map(|p| p.path.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert!(names[0].contains("_0."), "{names:?}");
         assert!(names[1].contains("_1."), "{names:?}");
@@ -602,7 +873,8 @@ mod tests {
 
         let (result, _dir) = run_batch(&server, &mut None, 3).await;
         // two distinct images; the compositor reuses the last for monitor 3
-        assert_eq!(result.unwrap().len(), 2);
+        let ids: Vec<String> = result.unwrap().into_iter().map(|p| p.id).collect();
+        assert_eq!(ids, ["1", "2"]);
     }
 
     #[tokio::test]
@@ -797,5 +1069,243 @@ mod tests {
             .map(|e| e.unwrap().path())
             .collect();
         assert_eq!(left, vec![path]);
+    }
+
+    // The loop's decisions, on a fake clock
+
+    use crate::schedule::{SavedState, ShownImage};
+    use crate::settings::{Interval, RotationMode};
+    use std::time::UNIX_EPOCH;
+
+    const HOUR: Duration = Duration::from_secs(3600);
+
+    fn t(secs: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(1_800_000_000 + secs)
+    }
+
+    fn set_up() -> Settings {
+        Settings {
+            stash_url: "http://stash:9999/".into(),
+            api_key: "key".into(),
+            interval: Interval::OneHour,
+            rotation_mode: RotationMode::Sequential,
+            ..Settings::default()
+        }
+    }
+
+    fn fresh(settings: &Settings) -> Engine {
+        Engine::from_saved(SavedState::default(), settings, None)
+    }
+
+    fn ok() -> Result<(PathBuf, Vec<ShownImage>), AppError> {
+        Ok((
+            PathBuf::from("/cache/wallpaper_1_0.jpg"),
+            vec![ShownImage {
+                id: "12".into(),
+                label: String::new(),
+                url: "http://stash:9999/images/12".into(),
+            }],
+        ))
+    }
+
+    fn failed() -> Result<(PathBuf, Vec<ShownImage>), AppError> {
+        Err(AppError::Stash("the server returned HTTP 502".into()))
+    }
+
+    /// Follow the loop's decisions from `start` until it rotates; return when.
+    fn next_rotation(engine: &mut Engine, start: SystemTime) -> SystemTime {
+        let mut now = start;
+        for _ in 0..100_000 {
+            match engine.next_step(now, HOUR) {
+                Step::Rotate => return now,
+                Step::Wait(wait) => {
+                    assert!(!wait.is_zero() && wait <= POLL, "waited {wait:?}");
+                    now += wait;
+                }
+            }
+        }
+        panic!("never rotated");
+    }
+
+    #[test]
+    fn a_fresh_start_rotates_right_away() {
+        assert_eq!(fresh(&set_up()).next_step(t(0), HOUR), Step::Rotate);
+    }
+
+    #[test]
+    fn after_a_success_it_waits_the_interval_a_minute_at_a_time() {
+        let settings = set_up();
+        let mut engine = fresh(&settings);
+        engine.record(t(0), ok(), &settings);
+        assert_eq!(next_rotation(&mut engine, t(0)), t(3600));
+    }
+
+    #[test]
+    fn failures_back_off_and_a_success_restores_the_interval() {
+        let settings = set_up();
+        let mut engine = fresh(&settings);
+        engine.record(t(0), failed(), &settings);
+        assert_eq!(next_rotation(&mut engine, t(0)), t(30));
+        engine.record(t(30), failed(), &settings);
+        assert_eq!(next_rotation(&mut engine, t(30)), t(90));
+        engine.record(t(90), failed(), &settings);
+        assert_eq!(next_rotation(&mut engine, t(90)), t(390));
+        assert!(engine.status.retry_at.is_some());
+        engine.record(t(390), ok(), &settings);
+        assert_eq!(next_rotation(&mut engine, t(390)), t(390 + 3600));
+        assert!(engine.status.error.is_none());
+    }
+
+    #[test]
+    fn paused_or_not_set_up_never_rotates() {
+        let settings = set_up();
+        let mut paused = fresh(&settings);
+        paused.status.paused = true;
+        assert_eq!(paused.next_step(t(0), HOUR), Step::Wait(POLL));
+
+        let mut unconfigured = fresh(&Settings::default());
+        assert_eq!(unconfigured.next_step(t(0), HOUR), Step::Wait(POLL));
+    }
+
+    #[test]
+    fn a_clock_set_backwards_costs_at_most_one_interval() {
+        let settings = set_up();
+        let mut engine = fresh(&settings);
+        // a rotation while the clock ran 10 hours ahead, then it's corrected
+        engine.record(t(10 * 3600), ok(), &settings);
+        assert_eq!(next_rotation(&mut engine, t(0)), t(3600));
+    }
+
+    #[test]
+    fn a_restart_picks_up_where_it_left_off() {
+        let settings = set_up();
+        let saved = SavedState {
+            last_rotated: Some(schedule::unix_secs(t(0))),
+            selection_key: schedule::selection_key(&settings),
+            rotation: crate::rotation::RotationSnapshot {
+                current_index: 7,
+                ..Default::default()
+            },
+            // saved before images kept their URL
+            shown: vec![ShownImage {
+                id: "12".into(),
+                label: String::new(),
+                url: String::new(),
+            }],
+            paused: false,
+            ..SavedState::default()
+        };
+
+        // two days later, it's due and continues at page 8
+        let mut engine = Engine::from_saved(saved.clone(), &settings, None);
+        assert_eq!(engine.next_step(t(2 * 86400), HOUR), Step::Rotate);
+        let next = engine
+            .rotation
+            .select_next(RotationMode::Sequential, 10)
+            .unwrap();
+        assert_eq!(next.page, 8);
+        assert_eq!(engine.status.open[0].url, "http://stash:9999/images/12");
+
+        // ten minutes later, it isn't due yet
+        let mut engine = Engine::from_saved(saved.clone(), &settings, None);
+        assert!(matches!(engine.next_step(t(600), HOUR), Step::Wait(_)));
+
+        // with a different filter the old position doesn't apply
+        let other = Settings {
+            query_filter: r#"{"filter": {"sort": "rating"}}"#.into(),
+            ..settings
+        };
+        let mut engine = Engine::from_saved(saved, &other, None);
+        let next = engine
+            .rotation
+            .select_next(RotationMode::Sequential, 10)
+            .unwrap();
+        assert_eq!(next.page, 1);
+    }
+
+    #[test]
+    fn pausing_survives_a_restart() {
+        let saved = SavedState {
+            paused: true,
+            ..SavedState::default()
+        };
+        let engine = Engine::from_saved(saved, &set_up(), None);
+        assert!(engine.status.paused);
+    }
+
+    #[test]
+    fn saving_settings_keeps_the_position_unless_image_selection_changed() {
+        let settings = set_up();
+        let mut engine = fresh(&settings);
+        for _ in 0..3 {
+            engine.rotation.select_next(RotationMode::Sequential, 10);
+        }
+        engine.settings_changed(&Settings {
+            interval: Interval::Daily,
+            ..settings.clone()
+        });
+        let next = engine
+            .rotation
+            .select_next(RotationMode::Sequential, 10)
+            .unwrap();
+        assert_eq!(next.page, 4);
+
+        engine.settings_changed(&Settings {
+            query_filter: r#"{"filter": {"sort": "rating"}}"#.into(),
+            ..settings
+        });
+        let next = engine
+            .rotation
+            .select_next(RotationMode::Sequential, 10)
+            .unwrap();
+        assert_eq!(next.page, 1);
+    }
+
+    #[test]
+    fn saving_an_unconfigured_state_clears_a_stale_error() {
+        let settings = set_up();
+        let mut engine = fresh(&settings);
+        engine.record(t(0), failed(), &settings);
+        engine.settings_changed(&Settings::default());
+        assert!(!engine.status.configured);
+        assert!(engine.status.error.is_none());
+        assert!(engine.status.retry_at.is_none());
+    }
+
+    #[test]
+    fn a_clock_correction_also_fixes_what_the_tray_says() {
+        let settings = set_up();
+        let mut engine = fresh(&settings);
+        engine.record(t(10 * 3600), failed(), &settings);
+        assert_eq!(engine.status.retry_at, Some(t(10 * 3600 + 30)));
+        engine.next_step(t(0), HOUR);
+        assert_eq!(engine.status.retry_at, Some(t(30)));
+        assert!(engine.needs_refresh);
+
+        let mut engine = fresh(&settings);
+        engine.record(t(10 * 3600), ok(), &settings);
+        engine.next_step(t(0), HOUR);
+        assert_eq!(engine.status.last_changed, Some(t(0)));
+    }
+
+    #[test]
+    fn open_in_stash_keeps_the_server_an_image_came_from() {
+        let saved = SavedState {
+            shown: vec![ShownImage {
+                id: "12".into(),
+                label: String::new(),
+                url: "http://old-server:9999/images/12".into(),
+            }],
+            ..SavedState::default()
+        };
+        let moved = Settings {
+            stash_url: "http://new-server:9999".into(),
+            ..set_up()
+        };
+        let engine = Engine::from_saved(saved, &moved, None);
+        assert_eq!(
+            engine.status.open[0].url,
+            "http://old-server:9999/images/12"
+        );
     }
 }

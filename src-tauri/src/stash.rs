@@ -436,7 +436,7 @@ pub async fn download_image(
         }
     }
 
-    std::fs::create_dir_all(cache_dir)?;
+    tokio::fs::create_dir_all(cache_dir).await?;
 
     // Use a unique filename so GNOME/KDE detect the wallpaper changed
     // (they cache by path and may not notice the file content changed)
@@ -446,7 +446,7 @@ pub async fn download_image(
         index,
         ext
     ));
-    std::fs::write(&file_path, &bytes)?;
+    tokio::fs::write(&file_path, &bytes).await?;
 
     Ok(Download::Saved(file_path))
 }

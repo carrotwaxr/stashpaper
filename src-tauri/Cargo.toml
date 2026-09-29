@@ -28,6 +28,13 @@ wallpaper = "3.2"
 rand = "0.10"
 thiserror = "2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
+tauri-plugin-single-instance = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-log = "2"
+log = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Not used directly: its "log" feature sends plugin errors (single-instance) to the log file
+tracing = { version = "0.1", features = ["log"] }
 
 [dev-dependencies]
 tempfile = "3"
