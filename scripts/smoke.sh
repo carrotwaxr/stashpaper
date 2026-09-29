@@ -29,15 +29,32 @@ if [ -z "$log" ]; then
 fi
 echo "Log file: $log"
 cat "$log"
+if ! grep -q "StashPaper .* starting" "$log"; then
+  echo "The log has no startup line"
+  exit 1
+fi
 
-# A second copy should hand over to the first and exit
+# A second copy should hand over to the first (which logs it) and exit
 if ! timeout 20 "$app" >"$home/second.out" 2>&1; then
   echo "The second launch didn't exit cleanly:"
   cat "$home/second.out"
   exit 1
 fi
+sleep 2
 if ! kill -0 "$pid" 2>/dev/null; then
   echo "The first copy died when the second one launched"
+  exit 1
+fi
+if ! grep -q "handed over" "$log"; then
+  echo "The first copy never heard from the second launch:"
+  cat "$log"
+  exit 1
+fi
+
+# The engine logs instead of crashing the app, so look for that too
+if grep -q "\[ERROR\]" "$log"; then
+  echo "Errors in the log:"
+  grep "\[ERROR\]" "$log"
   exit 1
 fi
 echo "Smoke test passed"

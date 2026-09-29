@@ -66,9 +66,12 @@ pub struct SavedState {
 /// One image on the desktop: its Stash id and, with per-monitor wallpapers,
 /// which monitor it's on.
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ShownImage {
     pub id: String,
     pub label: String,
+    /// Its Stash page, fixed when it was shown (the server may change since)
+    pub url: String,
 }
 
 impl SavedState {
@@ -227,6 +230,7 @@ mod tests {
             shown: vec![ShownImage {
                 id: "12".into(),
                 label: "Monitor 1 (1920x1080)".into(),
+                url: "http://stash:9999/images/12".into(),
             }],
             paused: true,
         };

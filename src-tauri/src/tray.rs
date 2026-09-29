@@ -123,7 +123,8 @@ fn tooltip(status: &TrayStatus, now: SystemTime) -> String {
         Some(error) => error.clone(),
         None => status_line(status, now),
     };
-    truncate(&format!("StashPaper - {}", text), 250)
+    // Windows shows at most 127 characters of a tray tooltip
+    truncate(&format!("StashPaper - {}", text), 127)
 }
 
 /// One line of the tray menu.
@@ -371,21 +372,23 @@ mod tests {
     }
 
     #[test]
-    fn tooltip_shows_more_of_the_error_but_not_all_of_a_huge_one() {
-        let status = TrayStatus {
-            error: Some("y".repeat(150)),
+    fn tooltip_fits_what_windows_can_show() {
+        let short = TrayStatus {
+            error: Some("y".repeat(100)),
             ..configured()
         };
         assert_eq!(
-            tooltip(&status, SystemTime::now()),
-            format!("StashPaper - {}", "y".repeat(150))
+            tooltip(&short, SystemTime::now()),
+            format!("StashPaper - {}", "y".repeat(100))
         );
 
-        let huge = TrayStatus {
+        let long = TrayStatus {
             error: Some("z".repeat(1000)),
             ..configured()
         };
-        assert!(tooltip(&huge, SystemTime::now()).chars().count() <= 250);
+        let tip = tooltip(&long, SystemTime::now());
+        assert!(tip.chars().count() <= 127);
+        assert!(tip.ends_with("..."));
     }
 
     fn ids(entries: &[Entry]) -> Vec<String> {

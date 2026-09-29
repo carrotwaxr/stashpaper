@@ -174,6 +174,7 @@ pub fn run() {
         // Must be registered first: a second launch hands over to the running
         // instance and exits before anything else starts
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            log::info!("Another launch handed over to this one; showing settings");
             show_settings_window(app);
         }))
         .plugin(

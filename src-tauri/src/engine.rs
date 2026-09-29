@@ -53,16 +53,30 @@ struct Engine {
     current: Option<PathBuf>,
     /// The images on the desktop, for "Open in Stash"
     shown: Vec<schedule::ShownImage>,
+    /// The local date the tray was last drawn on, so "Changed at 14:05" can
+    /// become "yesterday at 14:05" after midnight
+    refreshed_on: Option<chrono::NaiveDate>,
+    /// The status changed outside a rotation (e.g. a clock correction)
+    needs_refresh: bool,
 }
 
 /// "Open in Stash" entries for the images on the desktop.
+fn image_url(stash_url: &str, id: &str) -> String {
+    format!("{}/images/{}", stash_url.trim_end_matches('/'), id)
+}
+
+/// "Open in Stash" entries for the images on the desktop. State saved before
+/// images kept their URL falls back to the current server.
 fn open_items(stash_url: &str, shown: &[schedule::ShownImage]) -> Vec<crate::tray::OpenItem> {
-    let base = stash_url.trim_end_matches('/');
     shown
         .iter()
         .map(|image| crate::tray::OpenItem {
             label: image.label.clone(),
-            url: format!("{}/images/{}", base, image.id),
+            url: if image.url.is_empty() {
+                image_url(stash_url, &image.id)
+            } else {
+                image.url.clone()
+            },
         })
         .collect()
 }
@@ -114,6 +128,8 @@ impl Engine {
             selection_key,
             current: saved.current_wallpaper,
             shown: saved.shown,
+            refreshed_on: None,
+            needs_refresh: false,
         }
     }
 
@@ -124,9 +140,13 @@ impl Engine {
         // the next rotation out by however far the clock moved
         if self.last_success.is_some_and(|t| t > now) {
             self.last_success = Some(now);
+            self.status.last_changed = Some(now);
+            self.needs_refresh = true;
         }
         if self.last_failure.is_some_and(|t| t > now) {
             self.last_failure = Some(now);
+            self.status.retry_at = Some(now + schedule::retry_delay(self.failures, interval));
+            self.needs_refresh = true;
         }
         if !self.status.configured || self.status.paused {
             return Step::Wait(POLL);
@@ -195,10 +215,16 @@ impl Engine {
         }
     }
 
+    fn refresh_tray(&mut self, app: &tauri::AppHandle) {
+        crate::tray::refresh(app, &self.status);
+        self.refreshed_on = Some(chrono::Local::now().date_naive());
+        self.needs_refresh = false;
+    }
+
     fn set_paused(&mut self, paused: bool, app: &tauri::AppHandle) {
         self.status.paused = paused;
         self.save();
-        crate::tray::refresh(app, &self.status);
+        self.refresh_tray(app);
     }
 
     async fn rotate_and_record(
@@ -226,7 +252,7 @@ impl Engine {
         if succeeded {
             self.save();
         }
-        crate::tray::refresh(app, &self.status);
+        self.refresh_tray(app);
     }
 
     fn save(&self) {
@@ -249,11 +275,15 @@ impl Engine {
 
 pub async fn run(mut rx: CommandRx, settings: Arc<RwLock<Settings>>, app: tauri::AppHandle) {
     let mut engine = Engine::restore(&app, &*settings.read().await);
-    crate::tray::refresh(&app, &engine.status);
+    engine.refresh_tray(&app);
 
     loop {
         let interval = settings.read().await.interval.to_duration();
-        let wait = match engine.next_step(SystemTime::now(), interval) {
+        let step = engine.next_step(SystemTime::now(), interval);
+        if engine.needs_refresh || engine.refreshed_on != Some(chrono::Local::now().date_naive()) {
+            engine.refresh_tray(&app);
+        }
+        let wait = match step {
             Step::Rotate => {
                 engine.rotate_and_record(&settings, &app).await;
                 continue;
@@ -277,7 +307,7 @@ pub async fn run(mut rx: CommandRx, settings: Arc<RwLock<Settings>>, app: tauri:
                         if engine.status.configured {
                             engine.rotate_and_record(&settings, &app).await;
                         } else {
-                            crate::tray::refresh(&app, &engine.status);
+                            engine.refresh_tray(&app);
                         }
                     }
                     Some(Command::Quit) | None => break,
@@ -564,6 +594,7 @@ async fn rotate(
         .enumerate()
         .map(|(index, p)| schedule::ShownImage {
             id: p.id.clone(),
+            url: image_url(&s.stash_url, &p.id),
             label: match monitors.get(index) {
                 Some(m) if per_monitor => {
                     format!("Monitor {} ({}x{})", index + 1, m.width, m.height)
@@ -1072,6 +1103,7 @@ mod tests {
             vec![ShownImage {
                 id: "12".into(),
                 label: String::new(),
+                url: "http://stash:9999/images/12".into(),
             }],
         ))
     }
@@ -1154,9 +1186,11 @@ mod tests {
                 current_index: 7,
                 ..Default::default()
             },
+            // saved before images kept their URL
             shown: vec![ShownImage {
                 id: "12".into(),
                 label: String::new(),
+                url: String::new(),
             }],
             paused: false,
             ..SavedState::default()
@@ -1236,5 +1270,42 @@ mod tests {
         assert!(!engine.status.configured);
         assert!(engine.status.error.is_none());
         assert!(engine.status.retry_at.is_none());
+    }
+
+    #[test]
+    fn a_clock_correction_also_fixes_what_the_tray_says() {
+        let settings = set_up();
+        let mut engine = fresh(&settings);
+        engine.record(t(10 * 3600), failed(), &settings);
+        assert_eq!(engine.status.retry_at, Some(t(10 * 3600 + 30)));
+        engine.next_step(t(0), HOUR);
+        assert_eq!(engine.status.retry_at, Some(t(30)));
+        assert!(engine.needs_refresh);
+
+        let mut engine = fresh(&settings);
+        engine.record(t(10 * 3600), ok(), &settings);
+        engine.next_step(t(0), HOUR);
+        assert_eq!(engine.status.last_changed, Some(t(0)));
+    }
+
+    #[test]
+    fn open_in_stash_keeps_the_server_an_image_came_from() {
+        let saved = SavedState {
+            shown: vec![ShownImage {
+                id: "12".into(),
+                label: String::new(),
+                url: "http://old-server:9999/images/12".into(),
+            }],
+            ..SavedState::default()
+        };
+        let moved = Settings {
+            stash_url: "http://new-server:9999".into(),
+            ..set_up()
+        };
+        let engine = Engine::from_saved(saved, &moved, None);
+        assert_eq!(
+            engine.status.open[0].url,
+            "http://old-server:9999/images/12"
+        );
     }
 }
