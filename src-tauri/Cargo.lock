@@ -3850,7 +3850,7 @@ dependencies = [
  "tokio",
  "tracing",
  "wallpaper",
- "windows 0.61.3",
+ "windows 0.62.2",
  "wiremock",
 ]
 
