@@ -38,7 +38,7 @@ tracing = { version = "0.1", features = ["log"] }
 
 [target.'cfg(windows)'.dependencies]
 # IDesktopWallpaper, for a different image per monitor; same version Tauri uses
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell"] }
 
 [dev-dependencies]
 tempfile = "3"
